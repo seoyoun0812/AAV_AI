@@ -1,0 +1,731 @@
+"""LightAAV: residual light attention regression on ESM1v per-residue embeddings.
+
+Per-residue ESM1v embeddings are fed to a residual light-attention head
+(Gado et al., 2025) that applies local attention over the sequence and pools it
+into a variant-level prediction. The ESM1v encoder can optionally be adapted
+with LoRA adapters on selected transformer layers.
+
+Usage:
+    python src/lightaav.py --target_column striatum_enrichment
+    python src/lightaav.py --finetune_esm --lora_target_layers 29 30 31 32
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import warnings
+
+import esm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import common  # noqa: E402
+
+warnings.filterwarnings("ignore")
+
+try:
+    from peft import (
+        LoraConfig,
+        TaskType,
+        get_peft_model,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
+    )
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
+try:
+    # ResidualLightAttention is provided by the EpHod reference implementation;
+    # see README for how to make it importable.
+    from training import nn_models
+except ImportError as exc:  # pragma: no cover - depends on user environment
+    raise ImportError(
+        "Could not import 'training.nn_models'. LightAAV reuses the "
+        "ResidualLightAttention head from EpHod; clone that repository and add "
+        "it to PYTHONPATH (see README, 'External dependencies')."
+    ) from exc
+
+# LightAAV is defined on ESM1v; its per-residue width and final layer index.
+ESM_MODEL = "esm1v_t33_650M_UR90S_1"
+ESM_EMBED_DIM = 1280
+ESM_REPR_LAYER = 33
+
+# Friendly LoRA target names mapped onto ESM1v submodule names.
+LORA_MODULE_ALIASES = {
+    "query": "q_proj",
+    "key": "k_proj",
+    "value": "v_proj",
+    "dense": "out_proj",
+    "out_proj": "out_proj",
+    "intermediate": "fc1",
+    "output": "fc2",
+    "fc1": "fc1",
+    "fc2": "fc2",
+}
+ATTENTION_MODULES = {"q_proj", "k_proj", "v_proj", "out_proj"}
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Train LightAAV for AAV capsid property prediction"
+    )
+
+    # Data
+    parser.add_argument("--train_csv", type=str, default="data/train.csv")
+    parser.add_argument("--val_csv", type=str, default="data/valid.csv")
+    parser.add_argument("--test_csv", type=str, default="data/test.csv")
+    parser.add_argument("--fasta_path", type=str, default="data/sequences.fasta",
+                        help="FASTA of full-length capsid sequences")
+    parser.add_argument("--target_column", type=str, required=True,
+                        help="Regression target column in the CSV files")
+    parser.add_argument("--sequence_column", type=str, default="full_sequence")
+
+    # Optimisation
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--min_epoch", type=int, default=80,
+                        help="Early stopping is only considered after this epoch")
+    parser.add_argument("--max_epoch", type=int, default=400)
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="Learning rate for the residual light attention head")
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
+    parser.add_argument("--patience", type=int, default=15,
+                        help="Early stopping patience")
+    parser.add_argument("--lr_factor", type=float, default=0.7,
+                        help="ReduceLROnPlateau decay factor")
+    parser.add_argument("--lr_patience", type=int, default=10,
+                        help="ReduceLROnPlateau patience")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+
+    # Architecture
+    parser.add_argument("--kernel_size", type=int, default=7)
+    parser.add_argument("--res_blocks", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--activation", type=str, default="elu")
+
+    # LoRA fine-tuning of the ESM1v encoder
+    parser.add_argument("--finetune_esm", action="store_true",
+                        help="Adapt the ESM1v encoder with LoRA adapters")
+    parser.add_argument("--esm_lr", type=float, default=1e-5)
+    parser.add_argument("--esm_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    parser.add_argument("--lora_target_modules", type=str, nargs="+",
+                        default=["query", "key", "value", "out_proj"],
+                        choices=sorted(LORA_MODULE_ALIASES),
+                        help="Which projections receive LoRA adapters")
+    parser.add_argument("--lora_target_layers", type=int, nargs="+", default=None,
+                        help="Transformer layer indices to adapt "
+                             "(e.g. 29 30 31 32). Default: all layers.")
+    parser.add_argument("--lora_bias", type=str, default="none",
+                        choices=["none", "all", "lora_only"])
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="Epochs training the head only before LoRA is enabled")
+
+    # Outputs
+    parser.add_argument("--save_dir", type=str, default="results/lightaav")
+    parser.add_argument("--save_embeddings", action="store_true",
+                        help="Include pooled embeddings in the predictions CSV")
+    parser.add_argument("--extract_attention", action="store_true",
+                        help="Write per-residue attention scores for the test set")
+    parser.add_argument("--attention_mode", type=str, default="average",
+                        choices=["average", "max"],
+                        help="How to aggregate attention across heads")
+
+    args = parser.parse_args()
+
+    if args.min_epoch > args.max_epoch:
+        raise ValueError(
+            f"min_epoch ({args.min_epoch}) cannot exceed max_epoch ({args.max_epoch})"
+        )
+    if args.finetune_esm:
+        if not PEFT_AVAILABLE:
+            raise ValueError(
+                "LoRA fine-tuning requires the 'peft' package: pip install peft"
+            )
+        if args.lora_alpha < args.lora_rank:
+            print(f"Warning: lora_alpha ({args.lora_alpha}) < lora_rank "
+                  f"({args.lora_rank}); adaptation strength will be reduced.")
+    return args
+
+
+def resolve_lora_targets(module_names, target_layers):
+    """Expand friendly module names into PEFT target-module patterns."""
+    resolved = []
+    for name in module_names:
+        module = LORA_MODULE_ALIASES[name]
+        if target_layers is None:
+            # PEFT matches bare suffixes across every layer.
+            resolved.append(module)
+        else:
+            for layer_idx in target_layers:
+                prefix = f"layers.{layer_idx}"
+                if module in ATTENTION_MODULES:
+                    resolved.append(f"{prefix}.self_attn.{module}")
+                else:
+                    resolved.append(f"{prefix}.{module}")
+    return sorted(set(resolved))
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class LightAAVModel:
+    """ESM1v encoder (optionally LoRA-adapted) plus a light-attention head.
+
+    This is a plain container rather than an ``nn.Module`` because the encoder
+    and the head are optimised with separate parameter groups and learning
+    rates; ``is_training`` mirrors what ``nn.Module.training`` would give.
+    """
+
+    def __init__(self, args, device):
+        self.args = args
+        self.device = device
+        self.is_training = True
+        self.finetune_esm = args.finetune_esm
+        self.lora_model = None
+
+        self.esm_model, self.esm_batch_converter = self._load_esm()
+        self.head = self._init_head()
+
+        if self.finetune_esm:
+            self._setup_lora()
+        else:
+            self.esm_model.eval()
+            for param in self.esm_model.parameters():
+                param.requires_grad = False
+
+    # -- construction -------------------------------------------------------
+
+    def _load_esm(self):
+        model, alphabet = getattr(esm.pretrained, ESM_MODEL)()
+        model = model.to(self.device)
+        print(f"Loaded {ESM_MODEL} ({ESM_EMBED_DIM}-dim, layer {ESM_REPR_LAYER})")
+        return model, alphabet.get_batch_converter()
+
+    def _init_head(self):
+        head = nn_models.ResidualLightAttention(
+            dim=ESM_EMBED_DIM,
+            kernel_size=self.args.kernel_size,
+            dropout=self.args.dropout,
+            res_blocks=self.args.res_blocks,
+            activation=self.args.activation,
+        ).to(self.device)
+        n_params = sum(p.numel() for p in head.parameters())
+        print(f"Initialised residual light attention head ({n_params:,} parameters)")
+        return head
+
+    def _setup_lora(self):
+        target_layers = self.args.lora_target_layers
+        target_modules = resolve_lora_targets(
+            self.args.lora_target_modules, target_layers
+        )
+        print("Setting up LoRA on the ESM1v encoder")
+        print(f"  layers  : {target_layers if target_layers else 'all'}")
+        print(f"  modules : {target_modules[:5]}"
+              f"{'...' if len(target_modules) > 5 else ''} "
+              f"({len(target_modules)} total)")
+
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=self.args.lora_rank,
+            lora_alpha=self.args.lora_alpha,
+            lora_dropout=self.args.lora_dropout,
+            target_modules=target_modules,
+            bias=self.args.lora_bias,
+            inference_mode=False,
+        )
+        self.lora_model = get_peft_model(self.esm_model, lora_config)
+
+        base = self.lora_model.get_base_model()
+        if base is None:
+            raise RuntimeError(
+                "Could not retrieve the base model from the PEFT wrapper; "
+                "check the installed peft version."
+            )
+        # Forward passes go through the LoRA-injected base model.
+        self.esm_model = base
+
+        if target_layers is not None:
+            frozen = 0
+            keep = set(target_layers)
+            for name, param in self.lora_model.named_parameters():
+                if "lora_" not in name:
+                    continue
+                match = re.search(r"layers\.(\d+)\.", name)
+                if match and int(match.group(1)) not in keep:
+                    param.requires_grad = False
+                    frozen += 1
+            if frozen:
+                print(f"  froze {frozen} LoRA parameters outside the target layers")
+
+        trainable = sum(p.numel() for p in self.lora_model.parameters()
+                        if p.requires_grad)
+        total = sum(p.numel() for p in self.lora_model.parameters())
+        if trainable == 0:
+            raise RuntimeError(
+                "No trainable LoRA parameters were injected. Check "
+                "--lora_target_modules against the ESM1v module names."
+            )
+        print(f"  trainable: {trainable:,} / {total:,} "
+              f"({100 * trainable / total:.2f}%)")
+
+    # -- mode switching -----------------------------------------------------
+
+    def train(self, warmup_phase=False):
+        self.is_training = True
+        self.head.train()
+        adapt_encoder = self.finetune_esm and not warmup_phase
+        if self.lora_model is not None:
+            self.lora_model.train(adapt_encoder)
+        self.esm_model.train(adapt_encoder)
+
+    def eval(self):
+        self.is_training = False
+        self.head.eval()
+        if self.lora_model is not None:
+            self.lora_model.eval()
+        self.esm_model.eval()
+
+    # -- forward ------------------------------------------------------------
+
+    def embed(self, accs, seqs):
+        """Per-residue ESM1v embeddings as ``[batch, features, max_len]``.
+
+        BOS/EOS tokens are stripped so that position 0 is the first residue,
+        which is what the mask built in :meth:`forward` assumes.
+        """
+        seqs = [common.replace_noncanonical(seq) for seq in seqs]
+        _, _, tokens = self.esm_batch_converter(list(zip(accs, seqs)))
+        tokens = tokens.to(self.device, non_blocking=True)
+
+        if self.finetune_esm and self.is_training:
+            out = self.esm_model(tokens, repr_layers=[ESM_REPR_LAYER],
+                                 return_contacts=False)
+        else:
+            with torch.no_grad():
+                out = self.esm_model(tokens, repr_layers=[ESM_REPR_LAYER],
+                                     return_contacts=False)
+
+        reps = out["representations"][ESM_REPR_LAYER]
+        max_len = max(len(seq) for seq in seqs)
+
+        padded = []
+        for i, seq in enumerate(seqs):
+            residues = reps[i, 1:1 + len(seq), :]
+            if len(seq) < max_len:
+                pad = torch.zeros(max_len - len(seq), residues.size(1),
+                                  device=residues.device, dtype=residues.dtype)
+                residues = torch.cat([residues, pad], dim=0)
+            padded.append(residues)
+
+        # The head expects channels-first input.
+        return torch.stack(padded, dim=0).transpose(2, 1)
+
+    def forward(self, accs, seqs):
+        """Return ``(prediction, pooled_embedding, attention_weights)``."""
+        embeddings = self.embed(accs, seqs)
+        max_len = embeddings.shape[-1]
+        masks = torch.tensor(
+            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in seqs],
+            dtype=torch.int32, device=self.device,
+        )
+        return self.head(embeddings, masks)
+
+    # -- parameters and checkpoints ----------------------------------------
+
+    def trainable_lora_parameters(self):
+        if self.lora_model is None:
+            return []
+        return [p for p in self.lora_model.parameters() if p.requires_grad]
+
+    def save(self, path, epoch, optimizer, train_metrics, val_metrics):
+        checkpoint = {
+            "epoch": epoch,
+            "head_state_dict": self.head.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "esm_model": ESM_MODEL,
+            "finetune_esm": self.finetune_esm,
+            "args": vars(self.args),
+        }
+        if self.finetune_esm and self.lora_model is not None:
+            checkpoint["lora_state_dict"] = get_peft_model_state_dict(self.lora_model)
+        torch.save(checkpoint, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.head.load_state_dict(checkpoint["head_state_dict"])
+        if checkpoint.get("finetune_esm") and "lora_state_dict" in checkpoint:
+            if self.lora_model is None:
+                raise RuntimeError(
+                    "Checkpoint contains LoRA adapters but this model was built "
+                    "without --finetune_esm. Re-run with the same LoRA settings."
+                )
+            set_peft_model_state_dict(self.lora_model, checkpoint["lora_state_dict"])
+        return checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Optimiser
+# ---------------------------------------------------------------------------
+
+def build_optimizers(model, args):
+    """Head-only optimiser for warmup, plus a combined one for LoRA training."""
+    head_optimizer = optim.AdamW(
+        model.head.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    optimizers = {"head": head_optimizer, "combined": head_optimizer}
+
+    if args.finetune_esm:
+        lora_params = model.trainable_lora_parameters()
+        if lora_params:
+            optimizers["combined"] = optim.AdamW([
+                {"params": list(model.head.parameters()),
+                 "lr": args.lr, "weight_decay": args.weight_decay},
+                {"params": lora_params,
+                 "lr": args.esm_lr, "weight_decay": args.esm_weight_decay},
+            ])
+    return optimizers
+
+
+# ---------------------------------------------------------------------------
+# Train / evaluate
+# ---------------------------------------------------------------------------
+
+def run_epoch(model, loader, criterion, args, optimizer=None,
+              warmup_phase=False, desc="Train"):
+    """One pass over ``loader``; an optimizer switches on training behaviour."""
+    is_train = optimizer is not None
+    if is_train:
+        model.train(warmup_phase=warmup_phase)
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    predictions, targets = [], []
+
+    progress = tqdm.tqdm(loader, desc=desc)
+    with torch.set_grad_enabled(is_train):
+        for accs, seqs, batch_targets in progress:
+            batch_targets = batch_targets.to(model.device)
+
+            if is_train:
+                optimizer.zero_grad()
+            pred = model.forward(accs, seqs)[0]
+            loss = criterion(pred, batch_targets)
+
+            if is_train:
+                loss.backward()
+                if args.grad_clip > 0:
+                    if model.finetune_esm and not warmup_phase:
+                        lora_params = model.trainable_lora_parameters()
+                        if lora_params:
+                            nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+                    nn.utils.clip_grad_norm_(model.head.parameters(), args.grad_clip)
+                optimizer.step()
+
+            total_loss += loss.item()
+            predictions.extend(pred.detach().cpu().numpy())
+            targets.extend(batch_targets.cpu().numpy())
+            progress.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    metrics = common.regression_metrics(targets, predictions)
+    metrics["loss"] = total_loss / max(len(loader), 1)
+    return metrics
+
+
+@torch.no_grad()
+def collect_predictions(model, loader):
+    """Predictions, targets, pooled embeddings and identifiers for a split."""
+    model.eval()
+    preds, targets, embeddings, accs_all, seqs_all = [], [], [], [], []
+
+    for accs, seqs, batch_targets in loader:
+        pred, pooled, _ = model.forward(accs, seqs)
+        preds.extend(pred.cpu().numpy())
+        targets.extend(batch_targets.numpy())
+        embeddings.append(pooled.cpu().numpy())
+        accs_all.extend(accs)
+        seqs_all.extend(seqs)
+
+    return (np.asarray(preds), np.asarray(targets),
+            np.vstack(embeddings), accs_all, seqs_all)
+
+
+def train_model(model, train_loader, val_loader, args):
+    criterion = nn.MSELoss()
+    optimizers = build_optimizers(model, args)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizers["combined"], mode="min",
+        factor=args.lr_factor, patience=args.lr_patience,
+    )
+
+    history = common.new_history()
+    best_val_loss = float("inf")
+    patience_counter = 0
+    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
+
+    print(f"Training for {args.min_epoch}-{args.max_epoch} epochs "
+          f"(early stopping patience {args.patience})")
+
+    for epoch in range(1, args.max_epoch + 1):
+        warmup_phase = args.finetune_esm and epoch <= args.warmup_epochs
+        optimizer = optimizers["head"] if warmup_phase else optimizers["combined"]
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        label = " (warmup: head only)" if warmup_phase else ""
+        print(f"\nEpoch {epoch}/{args.max_epoch} (LR: {current_lr:.2e}){label}")
+
+        train_metrics = run_epoch(model, train_loader, criterion, args,
+                                  optimizer=optimizer, warmup_phase=warmup_phase,
+                                  desc="Training")
+        val_metrics = run_epoch(model, val_loader, criterion, args,
+                                desc="Validation")
+        if not warmup_phase:
+            scheduler.step(val_metrics["loss"])
+        common.update_history(history, train_metrics, val_metrics, current_lr)
+
+        print(f"Train - loss {train_metrics['loss']:.4f}, "
+              f"R2 {train_metrics['r2']:.4f}, MAE {train_metrics['mae']:.4f}")
+        print(f"Val   - loss {val_metrics['loss']:.4f}, "
+              f"R2 {val_metrics['r2']:.4f}, MAE {val_metrics['mae']:.4f}")
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            patience_counter = 0
+            model.save(checkpoint_path, epoch, optimizer, train_metrics, val_metrics)
+            print(f"New best model saved (val loss {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        if epoch >= args.min_epoch and patience_counter >= args.patience:
+            print(f"Early stopping after {epoch} epochs")
+            break
+        if epoch < args.min_epoch:
+            print(f"Minimum epoch not reached ({epoch}/{args.min_epoch})")
+
+    return history, checkpoint_path
+
+
+# ---------------------------------------------------------------------------
+# Attention analysis
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def extract_attention_table(model, loader, save_dir, attention_mode="average"):
+    """Per-residue and per-sequence attention tables for a split."""
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    residue_rows, sequence_rows = [], []
+
+    for accs, seqs, _ in tqdm.tqdm(loader, desc="Extracting attention"):
+        weights = model.forward(accs, seqs)[2]
+        for i, (acc, seq) in enumerate(zip(accs, seqs)):
+            per_head = weights[i, :, :len(seq)]
+            if attention_mode == "max":
+                scores = per_head.max(dim=0)[0]
+            else:
+                scores = per_head.mean(dim=0)
+            scores = scores.cpu().numpy()
+
+            spread = scores.max() - scores.min()
+            if spread > 0:
+                scores = (scores - scores.min()) / spread
+
+            for position, (residue, score) in enumerate(zip(seq, scores), start=1):
+                residue_rows.append({
+                    "protein_id": acc,
+                    "position": position,
+                    "residue": residue,
+                    "attention_score": float(score),
+                    "sequence_length": len(seq),
+                })
+            sequence_rows.append({
+                "protein_id": acc,
+                "sequence": seq,
+                "sequence_length": len(seq),
+                "mean_attention": float(scores.mean()),
+                "max_attention": float(scores.max()),
+                "std_attention": float(scores.std()),
+            })
+
+    residue_df = pd.DataFrame(residue_rows)
+    sequence_df = pd.DataFrame(sequence_rows)
+    residue_df.to_csv(os.path.join(save_dir, "attention_per_residue.csv"), index=False)
+    sequence_df.to_csv(os.path.join(save_dir, "attention_per_sequence.csv"), index=False)
+    return residue_df, sequence_df
+
+
+def analyze_attention(residue_df, sequence_df, save_dir, attention_mode="average"):
+    """Aggregate attention by residue type and relative position, and plot."""
+    os.makedirs(save_dir, exist_ok=True)
+
+    by_residue = (
+        residue_df.groupby("residue")["attention_score"]
+        .agg(["mean", "std", "count", "min", "max"])
+        .reset_index()
+        .sort_values("mean", ascending=False)
+    )
+    by_residue.to_csv(os.path.join(save_dir, "residue_attention_analysis.csv"),
+                      index=False)
+
+    bins = np.linspace(0, 1, 21)
+    residue_df = residue_df.copy()
+    residue_df["relative_position"] = (
+        residue_df["position"] / residue_df["sequence_length"]
+    )
+    residue_df["position_bin"] = pd.cut(residue_df["relative_position"],
+                                        bins=bins, labels=False)
+    by_position = (
+        residue_df.groupby("position_bin")["attention_score"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .dropna(subset=["position_bin"])
+    )
+    by_position.to_csv(os.path.join(save_dir, "position_attention_analysis.csv"),
+                       index=False)
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+    axes[0].bar(by_residue["residue"], by_residue["mean"],
+                yerr=by_residue["std"], capsize=3, color="steelblue", alpha=0.85)
+    axes[0].set_xlabel("Residue")
+    axes[0].set_ylabel("Mean attention score")
+    axes[0].set_title("Attention by residue type")
+    axes[0].grid(True, axis="y", alpha=0.3)
+
+    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+    if len(by_position):
+        centers = bin_centers[by_position["position_bin"].astype(int)]
+        axes[1].plot(centers, by_position["mean"], "o-", linewidth=2, markersize=5)
+        axes[1].fill_between(centers,
+                             by_position["mean"] - by_position["std"],
+                             by_position["mean"] + by_position["std"], alpha=0.3)
+    axes[1].set_xlabel("Relative position in sequence")
+    axes[1].set_ylabel("Mean attention score")
+    axes[1].set_title("Attention along the sequence")
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].hist(residue_df["attention_score"], bins=50, alpha=0.75, density=True,
+                 color="steelblue")
+    axes[2].set_xlabel("Attention score")
+    axes[2].set_ylabel("Density")
+    axes[2].set_title("Attention score distribution")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "attention_analysis.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    summary = {
+        "total_residues": int(len(residue_df)),
+        "total_variants": int(len(sequence_df)),
+        "mean_attention_score": float(residue_df["attention_score"].mean()),
+        "std_attention_score": float(residue_df["attention_score"].std()),
+        "attention_mode": attention_mode,
+        "top_residues_by_mean_attention": by_residue.head(5)[
+            ["residue", "mean"]
+        ].to_dict("records"),
+    }
+    with open(os.path.join(save_dir, "attention_summary.json"), "w") as handle:
+        json.dump(summary, handle, indent=2)
+    print(f"Attention analysis saved to: {save_dir}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_arguments()
+    common.set_seed(args.seed)
+    device = common.get_device()
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    experiment_name = "LightAAV"
+    if args.finetune_esm:
+        experiment_name += f" + LoRA (r={args.lora_rank}, alpha={args.lora_alpha})"
+
+    print("=" * 60)
+    print("LightAAV")
+    print("=" * 60)
+    print(f"Target        : {args.target_column}")
+    print(f"ESM encoder   : {ESM_MODEL}")
+    print(f"Fine-tune ESM : {args.finetune_esm}")
+    if args.finetune_esm:
+        print(f"  LoRA r/alpha: {args.lora_rank} / {args.lora_alpha}")
+        print(f"  LoRA targets: {args.lora_target_modules}")
+        print(f"  LoRA layers : {args.lora_target_layers or 'all'}")
+        print(f"  ESM LR      : {args.esm_lr}")
+    print(f"Batch / LR    : {args.batch_size} / {args.lr}")
+    print(f"Epochs        : {args.min_epoch}-{args.max_epoch}")
+    print(f"Device        : {device}")
+    print(f"Save dir      : {args.save_dir}")
+    print("=" * 60)
+
+    train_loader, val_loader, test_loader = common.build_dataloaders(
+        args, drop_last_train=True
+    )
+    loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+
+    model = LightAAVModel(args, device)
+    history, checkpoint_path = train_model(model, train_loader, val_loader, args)
+
+    checkpoint = model.load(checkpoint_path)
+    print(f"\nLoaded best model from epoch {checkpoint['epoch']}")
+
+    common.save_training_history(history, args.save_dir)
+    common.plot_training_curves(history, args.save_dir,
+                                experiment_name=experiment_name)
+
+    all_metrics = {"best_epoch": checkpoint["epoch"]}
+    test_preds = test_targets = None
+    for split_name, loader in loaders.items():
+        preds, targets, embeddings, accs, seqs = collect_predictions(model, loader)
+        all_metrics[split_name] = common.regression_metrics(targets, preds)
+        if split_name == "test":
+            test_preds, test_targets = preds, targets
+            common.save_predictions_csv(
+                accs, seqs, targets, preds, args.save_dir,
+                embeddings=embeddings if args.save_embeddings else None,
+            )
+
+    common.plot_parity(test_targets, test_preds, args.save_dir,
+                       dataset_name="Test", experiment_name=experiment_name)
+    common.save_metrics_json(all_metrics, args.save_dir)
+
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS")
+    print("=" * 60)
+    for split_name in loaders:
+        print(common.format_metrics(split_name, all_metrics[split_name]))
+    print("=" * 60)
+
+    if args.extract_attention:
+        attention_dir = os.path.join(args.save_dir, "attention_analysis")
+        residue_df, sequence_df = extract_attention_table(
+            model, test_loader, attention_dir, args.attention_mode
+        )
+        analyze_attention(residue_df, sequence_df, attention_dir,
+                          args.attention_mode)
+
+    print(f"\nDone. Results written to {args.save_dir}")
+
+
+if __name__ == "__main__":
+    main()
