@@ -1,0 +1,24 @@
+# Core
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+matplotlib>=3.7
+tqdm>=4.65
+
+# Protein language model
+fair-esm>=2.0.0
+
+# GraphAAV (graph transformer encoder)
+# torch-scatter and torch-geometric must match your torch/CUDA build:
+#   pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
+torch-geometric>=2.3
+torch-scatter>=2.1
+
+# LightAAV LoRA adaptation (only needed with --finetune_esm)
+peft>=0.7
+
+# LightAAV also needs the ResidualLightAttention head from EpHod:
+#   git clone https://github.com/beckham-lab/EpHod.git
+#   export PYTHONPATH="$PWD/EpHod:$PYTHONPATH"
