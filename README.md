@@ -85,7 +85,7 @@ The two models were tuned independently.
 | Batch size | 64 | 32 |
 | LR schedule | ReduceLROnPlateau (0.7, patience 10) | none |
 | Early stopping | patience 15, after epoch 80 | patience 8, after epoch 80 |
-| Encoder | `esm2_t12_35M_UR50D` | `esm1v_t33_650M_UR90S_1` |
+| Encoder | `esm2_t12_35M_UR50D` | `esm2_t12_35M_UR50D` |
 
 ## Outputs
 
