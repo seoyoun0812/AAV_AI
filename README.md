@@ -1,24 +1,24 @@
-# AAV_AI — sequence-based prediction of AAV9 capsid production fitness and tissue enrichment
+# AAV_AI
 
-Code accompanying the manuscript *"Unveiling the structural basis of
-adeno-associated virus CNS tropism via geometric protein language modeling"*
-(under review). This repository is released anonymously for peer review.
+Code for a manuscript under peer review, released anonymously for review.
 
-Two attention-based regressors predict a scalar property (tissue-specific
-enrichment or production fitness) from a full-length AAV9 capsid sequence
-carrying randomized VR-IV (aa 452–456, 5-mer) and VR-VIII (aa 586–592, 7-mer)
-loops:
+## Overview
 
-| Model | Head | Interpretation output |
+A machine learning framework for engineering AAV9 capsids with enhanced CNS
+tropism. Two surface loops (VR-IV, VR-VIII) are randomized and screened in
+vivo, and models predict two properties of a variant directly from its
+sequence:
+
+- **Production fitness** — how well the capsid assembles and packages.
+- **Tissue enrichment** — how strongly it is enriched in a target tissue.
+
+Both are learned on top of frozen protein language model embeddings, and both
+output a per-residue attention signal for biological interpretation.
+
+| Model | Approach | Best for |
 | --- | --- | --- |
-| **GraphAAV** | Graph transformer over a sequence-local residue graph, followed by global attention pooling | Per-residue importance from message magnitude × pooling gate |
-| **LightAAV** | Residual light attention over per-residue embeddings | Per-residue local attention weights |
-
-Both take per-residue embeddings from a frozen protein language model as node /
-token features. LightAAV can additionally adapt the encoder with LoRA adapters
-on selected transformer layers.
-
----
+| **GraphAAV** | Graph transformer over a residue graph + attention pooling | Production fitness |
+| **LightAAV** | Residual light attention over per-residue embeddings (optional LoRA) | Tissue enrichment |
 
 ## Repository layout
 
@@ -27,18 +27,11 @@ on selected transformer layers.
 ├── README.md
 ├── requirements.txt
 ├── src/
-│   ├── common.py     # dataset, metrics, plots, checkpoint I/O shared by both models
-│   ├── graphaav.py   # GraphAAV: graph transformer encoder + global attention pooling
-│   └── lightaav.py   # LightAAV: residual light attention (+ optional LoRA)
-├── data/             # input CSV / FASTA (not distributed; see below)
-└── results/          # created at runtime
+│   ├── common.py     # dataset, metrics, plots, prediction export (shared)
+│   ├── graphaav.py   # GraphAAV
+│   └── lightaav.py   # LightAAV
+└── data/             # inputs (not distributed; see data/README.md)
 ```
-
-`common.py` holds everything the two models share — the dataset, the metric
-definitions, the parity plot and the training-curve plot — so that both are
-evaluated identically.
-
----
 
 ## Installation
 
@@ -47,110 +40,55 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`torch-scatter` and `torch-geometric` must match your installed PyTorch and
-CUDA build. If `pip install torch-scatter` fails, install the prebuilt wheel:
+`torch-scatter` / `torch-geometric` must match your PyTorch/CUDA build. If a
+plain install fails, use the prebuilt wheel index:
 
 ```bash
 pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 ```
 
+LightAAV reuses the `ResidualLightAttention` head from EpHod
+(Gado et al., *Nat. Mach. Intell.* 2025):
+
+```bash
+git clone https://github.com/jafetgado/EpHod.git
+export PYTHONPATH="$PWD/EpHod:$PYTHONPATH"
+```
+
+## Data
+
+Both scripts read three CSVs (train / validation / test) and one FASTA. Each
+CSV needs a sequence column (`full_sequence`) and a target column
+(`--target_column`); the FASTA holds the same sequences keyed by variant ID.
+See `data/README.md` for the layout.
 
 ## Usage
 
-### GraphAAV
-
 ```bash
-python src/graphaav.py \
-    --target_column production_fitness \
-    --save_dir results/graphaav_fitness \
-    --extract_attention
+python src/graphaav.py --target_column YOUR_TARGET_COLUMN --extract_attention
+python src/lightaav.py --target_column YOUR_TARGET_COLUMN --extract_attention
+
+# LightAAV with LoRA adaptation of the top encoder layers
+python src/lightaav.py --target_column YOUR_TARGET_COLUMN \
+    --finetune_esm --lora_target_layers 29 30 31 32
 ```
 
-`--mode all` additionally exports sequence-level representations before and
-after training (raw pooled ESM embeddings, pre-training GNN output,
-post-training GNN output), which is what the representation-space comparison
-figure is built from:
+Use `--help` for the full argument list.
 
-```bash
-python src/graphaav.py --mode all --compare_representations \
-    --target_column production_fitness
-```
+## Defaults
 
-### LightAAV
+The two models were tuned independently.
 
-```bash
-python src/lightaav.py \
-    --target_column striatum_enrichment \
-    --save_dir results/lightaav_striatum \
-    --extract_attention
-```
-
-With LoRA adaptation of the top four ESM1v layers:
-
-```bash
-python src/lightaav.py \
-    --target_column striatum_enrichment \
-    --finetune_esm --lora_target_layers 29 30 31 32 \
-    --lora_rank 16 --lora_alpha 32 --esm_lr 1e-5
-```
-
-Run either script with `--help` for the full argument list.
-
----
-
-## Default hyperparameters
-
-Defaults in both scripts follow the manuscript's training section:
-
-| Setting | Value |
-| --- | --- |
-| Optimiser | AdamW |
-| Learning rate | 5e-5 (LoRA adapters: 1e-5) |
-| Weight decay | 5e-5 (LoRA adapters: 1e-4) |
-| Batch size | 64 |
-| LR schedule | `ReduceLROnPlateau`, factor 0.7, patience 10 |
-| Early stopping | patience 15, only considered after epoch 80 |
-| Max epochs | 400 |
-| Loss | MSE |
-| Seed | 42 (`--seed`) |
-
-The best checkpoint by validation loss is saved and restored before final
-evaluation. Seeding covers Python, NumPy and PyTorch and sets cuDNN to
-deterministic mode; scatter and atomic GPU kernels remain non-deterministic,
-so repeated runs agree to within small floating-point differences rather than
-bitwise.
-
----
+| | GraphAAV | LightAAV |
+| --- | --- | --- |
+| Learning rate | 1e-4 | 1e-4 (LoRA: 1e-5) |
+| Batch size | 64 | 32 |
+| LR schedule | ReduceLROnPlateau (0.7, patience 10) | none |
+| Early stopping | patience 15, after epoch 80 | patience 8, after epoch 80 |
+| Encoder | `esm2_t12_35M_UR50D` | `esm1v_t33_650M_UR90S_1` |
 
 ## Outputs
 
-Each run writes to `--save_dir`:
-
-| File | Contents |
-| --- | --- |
-| `best_model.pt` | Best checkpoint (weights, optimiser state, metrics, resolved arguments) |
-| `training_history.csv` | Per-epoch loss, R², MAE and learning rate |
-| `training_curves.png` | Loss / R² / MAE / LR curves with the best epoch marked |
-| `parity_plot_test.png` | Test parity plot with marginal histograms and KDEs |
-| `test_predictions.csv` | Per-variant true and predicted values with error columns |
-| `metrics.json` | R², RMSE and MAE for train / validation / test |
-| `attention_analysis/` | Per-residue and per-variant attention tables (with `--extract_attention`) |
-
-R² is the coefficient of determination (`sklearn.metrics.r2_score`) everywhere,
-including on the parity plot.
-
----
-
-## Notes
-
-- The protein language model is frozen unless `--finetune_esm` is passed, and
-  its weights are excluded from the saved checkpoints; only the trained head
-  (and any LoRA adapters) are stored.
-- GraphAAV builds edges between residues within a ±3 position window. Each
-  directed edge (i, j) carries
-  `[|i-j|/3, sign(j-i), 1{|i-j|=1}, 1{|i-j|=2}, 1{|i-j|=3}]`,
-  giving position-aware learning from sequence topology alone, with no 3D
-  coordinates required.
-- Sequencing data underlying the target values are available from the
-  corresponding author on reasonable request and are therefore not included in
-  this repository.
+Each run writes a checkpoint, training history, training curves, a parity
+plot, per-variant predictions, and (with `--extract_attention`) per-residue
+attention tables to `--save_dir`.
