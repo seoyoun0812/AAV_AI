@@ -1,0 +1,810 @@
+"""GraphAAV: graph-transformer regression on ESM per-residue embeddings.
+
+Each capsid variant is turned into a sequence-local graph: nodes are residues
+carrying per-residue protein-language-model embeddings, and edges connect
+residues within a +/-3 position window with a 5-dimensional relative-position
+feature. A TransformerConv encoder with edge updates and context gating
+produces node states, which are pooled by global attention and mapped to a
+scalar (tissue enrichment or production fitness) by an MLP head.
+
+Usage:
+    python src/graphaav.py --mode train --target_column production_fitness
+    python src/graphaav.py --mode all --compare_representations
+"""
+
+import argparse
+import os
+import sys
+import warnings
+
+import esm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch_geometric
+import torch_geometric.data
+import tqdm
+from sklearn.decomposition import PCA
+from torch_geometric.nn import GlobalAttention, TransformerConv
+from torch_scatter import scatter_mean
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import common  # noqa: E402
+
+warnings.filterwarnings("ignore")
+
+# Per-residue embedding size and final representation layer of each supported
+# encoder. Keeping the loader name, the width and the layer index in one place
+# avoids the three-way mismatch that arises when they are hard-coded separately.
+ESM_MODELS = {
+    "esm1v_t33_650M_UR90S_1": {"embed_dim": 1280, "repr_layer": 33},
+    "esm2_t12_35M_UR50D": {"embed_dim": 480, "repr_layer": 12},
+    "esm2_t30_150M_UR50D": {"embed_dim": 640, "repr_layer": 30},
+}
+
+# Residues are connected to neighbours within this window (manuscript Eq. 4).
+EDGE_WINDOW = 3
+EDGE_FEATURE_DIM = 5
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Train GraphAAV for AAV capsid property prediction"
+    )
+
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "all"],
+                        help="'train' trains and evaluates; 'all' additionally "
+                             "extracts ESM/GNN representations before and after training")
+
+    # Data
+    parser.add_argument("--train_csv", type=str, default="data/train.csv")
+    parser.add_argument("--val_csv", type=str, default="data/valid.csv")
+    parser.add_argument("--test_csv", type=str, default="data/test.csv")
+    parser.add_argument("--fasta_path", type=str, default="data/sequences.fasta",
+                        help="FASTA of full-length capsid sequences")
+    parser.add_argument("--target_column", type=str, default="production_fitness",
+                        help="Regression target column in the CSV files")
+    parser.add_argument("--sequence_column", type=str, default="full_sequence")
+
+    # Optimisation
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--min_epoch", type=int, default=80,
+                        help="Early stopping is only considered after this epoch")
+    parser.add_argument("--max_epoch", type=int, default=400)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
+    parser.add_argument("--patience", type=int, default=15,
+                        help="Early stopping patience")
+    parser.add_argument("--lr_factor", type=float, default=0.7,
+                        help="ReduceLROnPlateau decay factor")
+    parser.add_argument("--lr_patience", type=int, default=10,
+                        help="ReduceLROnPlateau patience")
+    parser.add_argument("--seed", type=int, default=42)
+
+    # Architecture
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--esm_model", type=str, default="esm1v_t33_650M_UR90S_1",
+                        choices=sorted(ESM_MODELS))
+
+    # Outputs
+    parser.add_argument("--save_dir", type=str, default="results/graphaav")
+    parser.add_argument("--extract_attention", action="store_true",
+                        help="Write per-residue attention scores for the test set")
+    parser.add_argument("--compare_representations", action="store_true",
+                        help="Plot PCA / performance comparison of representations "
+                             "(requires --mode all)")
+
+    args = parser.parse_args()
+    if args.min_epoch > args.max_epoch:
+        raise ValueError(
+            f"min_epoch ({args.min_epoch}) cannot exceed max_epoch ({args.max_epoch})"
+        )
+    if args.hidden_dim % args.num_heads != 0:
+        raise ValueError("hidden_dim must be divisible by num_heads")
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+def create_graph_from_sequence(sequence, node_embeddings, device):
+    """Build the sequence-local graph for one variant.
+
+    Args:
+        sequence: capsid sequence (length L).
+        node_embeddings: per-residue embeddings, shape ``[L, d]``.
+        device: device on which to allocate the graph tensors.
+
+    Returns:
+        ``Data`` with ``x=[L, d]``, ``edge_index`` and ``edge_attr=[E, 5]``,
+        where each edge feature is
+        ``[|i-j|/3, sign(j-i), 1{|i-j|=1}, 1{|i-j|=2}, 1{|i-j|=3}]``.
+    """
+    length = len(sequence)
+    src, dst, edge_feat = [], [], []
+
+    for i in range(length):
+        for j in range(max(0, i - EDGE_WINDOW), min(length, i + EDGE_WINDOW + 1)):
+            if i == j:
+                continue
+            src.append(i)
+            dst.append(j)
+            offset = abs(i - j)
+            edge_feat.append([
+                offset / EDGE_WINDOW,
+                1.0 if j > i else -1.0,
+                float(offset == 1),
+                float(offset == 2),
+                float(offset == 3),
+            ])
+
+    return torch_geometric.data.Data(
+        x=node_embeddings.to(device),
+        edge_index=torch.tensor([src, dst], device=device, dtype=torch.long),
+        edge_attr=torch.tensor(edge_feat, device=device, dtype=torch.float),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Encoder blocks
+# ---------------------------------------------------------------------------
+
+class EdgeMLP(nn.Module):
+    """Update each edge from its two endpoint node states."""
+
+    def __init__(self, num_hidden, dropout=0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.BatchNorm1d(num_hidden)
+        self.W11 = nn.Linear(3 * num_hidden, num_hidden, bias=True)
+        self.W12 = nn.Linear(num_hidden, num_hidden, bias=True)
+        self.act = nn.GELU()
+
+    def forward(self, h_V, edge_index, h_E):
+        src_idx, dst_idx = edge_index[0], edge_index[1]
+        h_EV = torch.cat([h_V[src_idx], h_E, h_V[dst_idx]], dim=-1)
+        h_message = self.W12(self.act(self.W11(h_EV)))
+        return self.norm(h_E + self.dropout(h_message))
+
+
+class Context(nn.Module):
+    """Gate node states by a graph-level context vector."""
+
+    def __init__(self, num_hidden):
+        super().__init__()
+        self.V_MLP_g = nn.Sequential(
+            nn.Linear(num_hidden, num_hidden),
+            nn.ReLU(),
+            nn.Linear(num_hidden, num_hidden),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, h_V, batch_id):
+        c_V = scatter_mean(h_V, batch_id, dim=0)
+        return h_V * self.V_MLP_g(c_V[batch_id])
+
+
+class GNNLayer(nn.Module):
+    """Edge-conditioned multi-head message passing with an edge update."""
+
+    def __init__(self, num_hidden, dropout=0.0, num_heads=4):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.ModuleList([nn.BatchNorm1d(num_hidden) for _ in range(2)])
+        self.attention = TransformerConv(
+            in_channels=num_hidden,
+            out_channels=num_hidden // num_heads,
+            heads=num_heads,
+            dropout=dropout,
+            edge_dim=num_hidden,
+            root_weight=False,
+        )
+        self.PositionWiseFeedForward = nn.Sequential(
+            nn.Linear(num_hidden, num_hidden * 4),
+            nn.ReLU(),
+            nn.Linear(num_hidden * 4, num_hidden),
+        )
+        self.edge_update = EdgeMLP(num_hidden, dropout)
+        self.context = Context(num_hidden)
+
+    def forward(self, h_V, edge_index, h_E, batch_id):
+        dh = self.attention(h_V, edge_index, h_E)
+        h_V = self.norm[0](h_V + self.dropout(dh))
+
+        dh = self.PositionWiseFeedForward(h_V)
+        h_V = self.norm[1](h_V + self.dropout(dh))
+
+        h_E = self.edge_update(h_V, edge_index, h_E)
+        h_V = self.context(h_V, batch_id)
+        return h_V, h_E
+
+
+class GraphEncoder(nn.Module):
+    """Input embeddings followed by a stack of :class:`GNNLayer` blocks."""
+
+    def __init__(self, node_in_dim, edge_in_dim, hidden_dim,
+                 num_layers=4, drop_rate=0.0, num_heads=4):
+        super().__init__()
+        self.node_embedding = nn.Linear(node_in_dim, hidden_dim, bias=True)
+        self.edge_embedding = nn.Linear(edge_in_dim, hidden_dim, bias=True)
+        self.norm_nodes = nn.BatchNorm1d(hidden_dim)
+        self.norm_edges = nn.BatchNorm1d(hidden_dim)
+        self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.W_e = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.layers = nn.ModuleList([
+            GNNLayer(num_hidden=hidden_dim, dropout=drop_rate, num_heads=num_heads)
+            for _ in range(num_layers)
+        ])
+
+    def embed_inputs(self, h_V, h_E):
+        h_V = self.W_v(self.norm_nodes(self.node_embedding(h_V)))
+        h_E = self.W_e(self.norm_edges(self.edge_embedding(h_E)))
+        return h_V, h_E
+
+    def forward(self, h_V, edge_index, h_E, batch_id):
+        h_V, h_E = self.embed_inputs(h_V, h_E)
+        for layer in self.layers:
+            h_V, h_E = layer(h_V, edge_index, h_E, batch_id)
+        return h_V
+
+
+# ---------------------------------------------------------------------------
+# ESM feature extraction
+# ---------------------------------------------------------------------------
+
+class ESMFeatureExtractor:
+    """Frozen protein language model producing per-residue embeddings.
+
+    The encoder is deliberately held outside ``nn.Module`` registration so its
+    weights are neither optimised nor written into GraphAAV checkpoints.
+    """
+
+    def __init__(self, model_name, device):
+        if model_name not in ESM_MODELS:
+            raise ValueError(
+                f"Unknown ESM model '{model_name}'. "
+                f"Available: {sorted(ESM_MODELS)}"
+            )
+        self.device = device
+        self.model_name = model_name
+        self.embed_dim = ESM_MODELS[model_name]["embed_dim"]
+        self.repr_layer = ESM_MODELS[model_name]["repr_layer"]
+
+        self.model, self.alphabet = getattr(esm.pretrained, model_name)()
+        self.batch_converter = self.alphabet.get_batch_converter()
+        self.model = self.model.to(device).eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        print(f"Loaded {model_name} (frozen, {self.embed_dim}-dim, "
+              f"layer {self.repr_layer})")
+
+    def extract(self, accs, seqs):
+        """Return a list of ``[L, d]`` tensors, one per sequence."""
+        seqs = [common.replace_noncanonical(seq) for seq in seqs]
+        data = list(zip(accs, seqs))
+
+        with torch.no_grad():
+            _, _, tokens = self.batch_converter(data)
+            tokens = tokens.to(self.device, non_blocking=True)
+            out = self.model(tokens, repr_layers=[self.repr_layer],
+                             return_contacts=False)
+            reps = out["representations"][self.repr_layer]
+            # Index 0 is the BOS token, so residue i sits at position i+1.
+            return [reps[i, 1:len(seq) + 1] for i, seq in enumerate(seqs)]
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class GraphAAV(nn.Module):
+    def __init__(self, hidden_dim, num_layers, dropout, device, num_heads=4,
+                 esm_model="esm1v_t33_650M_UR90S_1"):
+        super().__init__()
+        self.device = device
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+
+        self.esm_extractor = ESMFeatureExtractor(esm_model, device)
+
+        # Attribute names below are part of the checkpoint keys; renaming them
+        # would invalidate previously trained best_model.pt files.
+        self.Graph_encoder = GraphEncoder(
+            node_in_dim=self.esm_extractor.embed_dim,
+            edge_in_dim=EDGE_FEATURE_DIM,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            drop_rate=dropout,
+            num_heads=num_heads,
+        )
+        self.attention_pool = GlobalAttention(
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.BatchNorm1d(hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, 1),
+            )
+        )
+        self.regressor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.BatchNorm1d(hidden_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+
+        self._initialize_weights()
+        self.to(device)
+
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.bias, 0)
+                nn.init.constant_(module.weight, 1.0)
+
+    def build_batch(self, accs, seqs):
+        embeddings = self.esm_extractor.extract(accs, seqs)
+        graphs = [
+            create_graph_from_sequence(seq, emb, self.device)
+            for seq, emb in zip(seqs, embeddings)
+        ]
+        return torch_geometric.data.Batch.from_data_list(graphs).to(self.device)
+
+    def forward(self, accs, seqs):
+        batch = self.build_batch(accs, seqs)
+        h_V = self.Graph_encoder(batch.x, batch.edge_index, batch.edge_attr,
+                                 batch.batch)
+        pooled = self.attention_pool(h_V, batch.batch)
+        return self.regressor(pooled).squeeze(-1), pooled
+
+
+# ---------------------------------------------------------------------------
+# Residue-level attention
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def residue_attention_scores(model, acc, sequence):
+    """Per-residue importance for one variant, min-max normalised to [0, 1].
+
+    Combines the global attention-pooling gate with the mean magnitude of each
+    layer's message, which is what the manuscript reports as residue-level
+    interpretation.
+    """
+    model.eval()
+    batch = model.build_batch([acc], [sequence])
+
+    h_V, h_E = model.Graph_encoder.embed_inputs(batch.x, batch.edge_attr)
+    layer_importance = []
+    for layer in model.Graph_encoder.layers:
+        dh = layer.attention(h_V, batch.edge_index, h_E)
+        layer_importance.append(torch.norm(dh, dim=1))
+
+        h_V = layer.norm[0](h_V + layer.dropout(dh))
+        h_V = layer.norm[1](h_V + layer.dropout(layer.PositionWiseFeedForward(h_V)))
+        h_E = layer.edge_update(h_V, batch.edge_index, h_E)
+        h_V = layer.context(h_V, batch.batch)
+
+    gate = torch.softmax(model.attention_pool.gate_nn(h_V), dim=0).squeeze(-1)
+    scores = gate * torch.stack(layer_importance).mean(dim=0)
+    scores = scores.cpu().numpy()
+
+    spread = scores.max() - scores.min()
+    if spread > 0:
+        scores = (scores - scores.min()) / spread
+    return scores
+
+
+def extract_attention_table(model, loader, save_dir):
+    """Write per-residue and per-sequence attention tables for a split."""
+    os.makedirs(save_dir, exist_ok=True)
+    residue_rows, sequence_rows = [], []
+
+    for accs, seqs, _ in tqdm.tqdm(loader, desc="Extracting attention"):
+        for acc, seq in zip(accs, seqs):
+            scores = residue_attention_scores(model, acc, seq)
+            for position, (residue, score) in enumerate(zip(seq, scores), start=1):
+                residue_rows.append({
+                    "protein_id": acc,
+                    "position": position,
+                    "residue": residue,
+                    "attention_score": float(score),
+                    "sequence_length": len(seq),
+                })
+            sequence_rows.append({
+                "protein_id": acc,
+                "sequence": seq,
+                "sequence_length": len(seq),
+                "mean_attention": float(scores.mean()),
+                "max_attention": float(scores.max()),
+                "std_attention": float(scores.std()),
+            })
+
+    residue_df = pd.DataFrame(residue_rows)
+    sequence_df = pd.DataFrame(sequence_rows)
+    residue_df.to_csv(os.path.join(save_dir, "attention_per_residue.csv"), index=False)
+    sequence_df.to_csv(os.path.join(save_dir, "attention_per_sequence.csv"), index=False)
+    print(f"Attention tables saved to: {save_dir}")
+    return residue_df, sequence_df
+
+
+# ---------------------------------------------------------------------------
+# Representation extraction
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def extract_representations(model, loaders, stage, use_gnn=True):
+    """Collect sequence-level representations across all splits.
+
+    Args:
+        loaders: ``{split_name: DataLoader}``.
+        stage: label recorded in the output (e.g. ``"post-training"``).
+        use_gnn: if True use the pooled GNN output and record predictions;
+            otherwise mean-pool the raw ESM embeddings.
+    """
+    model.eval()
+    collected = {
+        "embeddings": [], "predictions": [], "targets": [],
+        "protein_ids": [], "sequences": [], "dataset_labels": [],
+    }
+
+    for split_name, loader in loaders.items():
+        desc = f"{split_name} ({stage})"
+        for accs, seqs, targets in tqdm.tqdm(loader, desc=desc):
+            if use_gnn:
+                predictions, pooled = model(accs, seqs)
+                collected["embeddings"].append(pooled.cpu().numpy())
+                collected["predictions"].extend(predictions.cpu().numpy())
+            else:
+                embeddings = model.esm_extractor.extract(accs, seqs)
+                collected["embeddings"].append(
+                    np.stack([emb.mean(dim=0).cpu().numpy() for emb in embeddings])
+                )
+            collected["targets"].extend(targets.numpy())
+            collected["protein_ids"].extend(accs)
+            collected["sequences"].extend(seqs)
+            collected["dataset_labels"].extend([split_name] * len(accs))
+
+    collected["embeddings"] = np.vstack(collected["embeddings"])
+    collected["targets"] = np.asarray(collected["targets"])
+    collected["predictions"] = (
+        np.asarray(collected["predictions"]) if use_gnn else None
+    )
+    return collected
+
+
+def save_representations(representations, csv_path):
+    """Write representations (and predictions, when available) to CSV."""
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    embeddings = representations["embeddings"]
+
+    frame = {
+        "protein_id": representations["protein_ids"],
+        "dataset": representations["dataset_labels"],
+        "target": representations["targets"],
+    }
+    if representations["predictions"] is not None:
+        frame["prediction"] = representations["predictions"]
+        frame["error"] = representations["predictions"] - representations["targets"]
+    for i in range(embeddings.shape[1]):
+        frame[f"dim_{i}"] = embeddings[:, i]
+
+    df = pd.DataFrame(frame)
+    df.to_csv(csv_path, index=False, float_format="%.6f")
+    counts = df["dataset"].value_counts().to_dict()
+    print(f"Saved {len(df)} rows x {embeddings.shape[1]} dims to {csv_path} "
+          f"({counts})")
+    return df
+
+
+def plot_representation_comparison(initial, pre, post, output_dir, prefix):
+    """PCA of each representation plus a pre/post R2 comparison."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    for ax, (representation, title) in zip(axes, [
+        (initial, "Initial ESM"),
+        (pre, "Pre-training GNN"),
+        (post, "Post-training GNN"),
+    ]):
+        pca = PCA(n_components=2)
+        projected = pca.fit_transform(representation["embeddings"])
+        scatter = ax.scatter(projected[:, 0], projected[:, 1],
+                             c=representation["targets"], cmap="viridis",
+                             alpha=0.6, s=20)
+        explained = pca.explained_variance_ratio_
+        ax.set_title(f"{title}\n(Var explained: {explained.sum():.2%})")
+        ax.set_xlabel(f"PC1 ({explained[0]:.2%})")
+        ax.set_ylabel(f"PC2 ({explained[1]:.2%})")
+        plt.colorbar(scatter, ax=ax, label="Target value")
+
+    plt.suptitle(f"PCA comparison of representations\n{prefix}", fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"pca_comparison_{prefix}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    splits = ["train", "val", "test"]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    positions = np.arange(len(splits))
+    width = 0.35
+
+    for offset, representation, label, color in [
+        (-width / 2, pre, "Pre-training", "lightcoral"),
+        (width / 2, post, "Post-training", "lightgreen"),
+    ]:
+        scores = []
+        labels = np.asarray(representation["dataset_labels"])
+        for split in splits:
+            mask = labels == split
+            scores.append(
+                common.regression_metrics(
+                    representation["targets"][mask],
+                    representation["predictions"][mask],
+                )["r2"] if mask.any() else 0.0
+            )
+        bars = ax.bar(positions + offset, scores, width, label=label, color=color)
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{bar.get_height():.3f}", ha="center", va="bottom")
+
+    ax.set_xlabel("Dataset split")
+    ax.set_ylabel("R2 score")
+    ax.set_title(f"Model performance comparison\n{prefix}")
+    ax.set_xticks(positions)
+    ax.set_xticklabels(splits)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"performance_comparison_{prefix}.png"), dpi=300)
+    plt.close()
+    print(f"Comparison plots saved to: {output_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+def run_epoch(model, loader, criterion, device, optimizer=None, desc="Train"):
+    """One pass over ``loader``; an optimizer switches on training behaviour."""
+    is_train = optimizer is not None
+    model.train(is_train)
+
+    total_loss = 0.0
+    predictions, targets = [], []
+
+    progress = tqdm.tqdm(loader, desc=desc)
+    with torch.set_grad_enabled(is_train):
+        for accs, seqs, batch_targets in progress:
+            batch_targets = batch_targets.to(device)
+
+            if is_train:
+                optimizer.zero_grad()
+            pred, _ = model(accs, seqs)
+            loss = criterion(pred, batch_targets)
+            if is_train:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item()
+            predictions.extend(pred.detach().cpu().numpy())
+            targets.extend(batch_targets.cpu().numpy())
+            progress.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    metrics = common.regression_metrics(targets, predictions)
+    metrics["loss"] = total_loss / max(len(loader), 1)
+    return metrics
+
+
+@torch.no_grad()
+def collect_predictions(model, loader, device):
+    """Predictions, targets, pooled embeddings and identifiers for a split."""
+    model.eval()
+    preds, targets, embeddings, accs_all, seqs_all = [], [], [], [], []
+
+    for accs, seqs, batch_targets in loader:
+        pred, pooled = model(accs, seqs)
+        preds.extend(pred.cpu().numpy())
+        targets.extend(batch_targets.numpy())
+        embeddings.append(pooled.cpu().numpy())
+        accs_all.extend(accs)
+        seqs_all.extend(seqs)
+
+    return (np.asarray(preds), np.asarray(targets),
+            np.vstack(embeddings), accs_all, seqs_all)
+
+
+def train_model(model, train_loader, val_loader, args, device):
+    """Train with ReduceLROnPlateau, checkpointing and delayed early stopping."""
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience
+    )
+
+    history = common.new_history()
+    best_val_loss = float("inf")
+    patience_counter = 0
+    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
+
+    print(f"Training for {args.min_epoch}-{args.max_epoch} epochs "
+          f"(early stopping patience {args.patience})")
+
+    for epoch in range(1, args.max_epoch + 1):
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"\nEpoch {epoch}/{args.max_epoch} (LR: {current_lr:.2e})")
+
+        train_metrics = run_epoch(model, train_loader, criterion, device,
+                                  optimizer=optimizer, desc="Training")
+        val_metrics = run_epoch(model, val_loader, criterion, device,
+                                desc="Validation")
+        scheduler.step(val_metrics["loss"])
+        common.update_history(history, train_metrics, val_metrics, current_lr)
+
+        print(f"Train - loss {train_metrics['loss']:.4f}, "
+              f"R2 {train_metrics['r2']:.4f}, MAE {train_metrics['mae']:.4f}")
+        print(f"Val   - loss {val_metrics['loss']:.4f}, "
+              f"R2 {val_metrics['r2']:.4f}, MAE {val_metrics['mae']:.4f}")
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            patience_counter = 0
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "args": vars(args),
+            }, checkpoint_path)
+            print(f"New best model saved (val loss {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        if epoch >= args.min_epoch and patience_counter >= args.patience:
+            print(f"Early stopping after {epoch} epochs")
+            break
+        if epoch < args.min_epoch:
+            print(f"Minimum epoch not reached ({epoch}/{args.min_epoch})")
+
+    return history, checkpoint_path
+
+
+def evaluate_and_report(model, loaders, args, device, history):
+    """Restore the best checkpoint, then write metrics, plots and predictions."""
+    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"\nLoaded best model from epoch {checkpoint['epoch']}")
+
+    common.save_training_history(history, args.save_dir)
+    common.plot_training_curves(history, args.save_dir, experiment_name="GraphAAV")
+
+    all_metrics = {"best_epoch": checkpoint["epoch"]}
+    test_preds = test_targets = None
+    for split_name, loader in loaders.items():
+        preds, targets, embeddings, accs, seqs = collect_predictions(
+            model, loader, device
+        )
+        all_metrics[split_name] = common.regression_metrics(targets, preds)
+        if split_name == "test":
+            test_preds, test_targets = preds, targets
+            common.save_predictions_csv(accs, seqs, targets, preds, args.save_dir,
+                                        embeddings=embeddings)
+
+    common.plot_parity(test_targets, test_preds, args.save_dir,
+                       dataset_name="Test", experiment_name="GraphAAV")
+    common.save_metrics_json(all_metrics, args.save_dir)
+
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS")
+    print("=" * 60)
+    for split_name in loaders:
+        print(common.format_metrics(split_name, all_metrics[split_name]))
+    print("=" * 60)
+
+    if args.extract_attention:
+        extract_attention_table(
+            model, loaders["test"], os.path.join(args.save_dir, "attention_analysis")
+        )
+    return all_metrics
+
+
+def main():
+    args = parse_arguments()
+    common.set_seed(args.seed)
+    device = common.get_device()
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("GraphAAV")
+    print("=" * 60)
+    print(f"Mode          : {args.mode}")
+    print(f"Target        : {args.target_column}")
+    print(f"ESM encoder   : {args.esm_model}")
+    print(f"Hidden / heads: {args.hidden_dim} / {args.num_heads}")
+    print(f"Layers        : {args.num_layers}")
+    print(f"Batch / LR    : {args.batch_size} / {args.lr}")
+    print(f"Epochs        : {args.min_epoch}-{args.max_epoch}")
+    print(f"Device        : {device}")
+    print(f"Save dir      : {args.save_dir}")
+    print("=" * 60)
+
+    train_loader, val_loader, test_loader = common.build_dataloaders(args)
+    loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+
+    model = GraphAAV(
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        device=device,
+        num_heads=args.num_heads,
+        esm_model=args.esm_model,
+    )
+
+    prefix = f"heads_{args.num_heads}_layers_{args.num_layers}_hidden_{args.hidden_dim}"
+    initial_repr = pre_repr = None
+
+    if args.mode == "all":
+        # Representations are taken before training so that the pre/post
+        # comparison uses the same (unshuffled) ordering of samples.
+        eval_loaders = {
+            "train": torch.utils.data.DataLoader(
+                train_loader.dataset, batch_size=args.batch_size, shuffle=False,
+                collate_fn=common.collate_fn,
+            ),
+            "val": val_loader,
+            "test": test_loader,
+        }
+        print("\nExtracting initial ESM representations...")
+        initial_repr = extract_representations(model, eval_loaders, "initial",
+                                               use_gnn=False)
+        save_representations(
+            initial_repr,
+            os.path.join(args.save_dir, f"esm_representations_{prefix}.csv"),
+        )
+
+        print("\nExtracting pre-training GNN representations...")
+        pre_repr = extract_representations(model, eval_loaders, "pre-training")
+        save_representations(
+            pre_repr,
+            os.path.join(args.save_dir, f"gnn_representations_{prefix}_pre.csv"),
+        )
+
+    history, _ = train_model(model, train_loader, val_loader, args, device)
+    evaluate_and_report(model, loaders, args, device, history)
+
+    if args.mode == "all":
+        print("\nExtracting post-training GNN representations...")
+        post_repr = extract_representations(model, eval_loaders, "post-training")
+        save_representations(
+            post_repr,
+            os.path.join(args.save_dir, f"gnn_representations_{prefix}_post.csv"),
+        )
+        if args.compare_representations:
+            plot_representation_comparison(
+                initial_repr, pre_repr, post_repr,
+                os.path.join(args.save_dir, "representation_comparison"), prefix,
+            )
+
+    print(f"\nDone. Results written to {args.save_dir}")
+
+
+if __name__ == "__main__":
+    main()
