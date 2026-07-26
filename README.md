@@ -54,50 +54,6 @@ CUDA build. If `pip install torch-scatter` fails, install the prebuilt wheel:
 pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
 ```
 
-### External dependency (LightAAV only)
-
-The residual light attention head is the `ResidualLightAttention` module from
-the EpHod reference implementation
-(<https://github.com/beckham-lab/EpHod>). It is not vendored here to avoid
-duplicating third-party code. Make it importable before running LightAAV:
-
-```bash
-git clone https://github.com/beckham-lab/EpHod.git
-export PYTHONPATH="$PWD/EpHod:$PYTHONPATH"
-```
-
-GraphAAV has no external model dependency.
-
----
-
-## Data format
-
-Both scripts read three CSVs (train / validation / test) plus one FASTA.
-
-**CSV** — one row per capsid variant:
-
-| Column | Description |
-| --- | --- |
-| `full_sequence` | Full-length capsid sequence (141 aa in this study) |
-| *target column* | The regression target, e.g. `production_fitness` or a tissue enrichment column |
-
-Any additional columns are ignored. The column names are configurable with
-`--sequence_column` and `--target_column`.
-
-**FASTA** — the same sequences, keyed by variant accession. The accession is
-the first whitespace-delimited token of the header and is used as the
-`protein_id` in every output file. Rows whose sequence is missing from the
-FASTA are dropped with a warning, so the two files cross-check each other.
-
-Place the files under `data/` or point at them with `--train_csv`,
-`--val_csv`, `--test_csv` and `--fasta_path`.
-
-Target values are derived from NGS counts as described in the manuscript:
-production fitness is the log2 fold change in relative abundance between the
-plasmid and packaged virus libraries, and enrichment is the tissue-specific
-log2 enrichment relative to the virus pool.
-
----
 
 ## Usage
 
