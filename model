@@ -1,0 +1,410 @@
+"""Shared utilities for the GraphAAV and LightAAV training scripts.
+
+Both models consume the same inputs (a CSV of capsid variants + a FASTA of the
+corresponding full-length sequences) and are evaluated with the same metrics,
+so the dataset, metric, plotting and I/O code lives here rather than being
+duplicated in each entry point.
+"""
+
+import json
+import os
+import random
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from scipy.stats import gaussian_kde
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, Dataset
+
+plt.style.use("default")
+
+# Amino acids that ESM tokenizers do not model; mapped to the unknown token.
+NON_CANONICAL = ("B", "J", "O", "U", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    """Seed every RNG used in this project.
+
+    Note: scatter/atomic GPU kernels remain non-deterministic, so runs are
+    reproducible up to small floating-point differences rather than bitwise.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_device() -> str:
+    if not torch.cuda.is_available():
+        print("WARNING: no GPU available; training will be slow.")
+        return "cpu"
+    return "cuda"
+
+
+# ---------------------------------------------------------------------------
+# Sequence I/O
+# ---------------------------------------------------------------------------
+
+def read_fasta(fasta_path):
+    """Read a FASTA file into ``{accession: sequence}``.
+
+    The accession is the first whitespace-delimited token of the header.
+    """
+    fasta_dict = {}
+    header = None
+    with open(fasta_path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                header = line[1:].split()[0]
+                fasta_dict[header] = ""
+            elif header is not None:
+                fasta_dict[header] += line
+    return fasta_dict
+
+
+def replace_noncanonical(seq, replace_char="X"):
+    """Replace non-canonical amino acids with a single placeholder character."""
+    for char in NON_CANONICAL:
+        seq = seq.replace(char, replace_char)
+    return seq
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class ProteinDataset(Dataset):
+    """Capsid variants paired with a regression target.
+
+    Args:
+        csv_path: CSV with one row per variant.
+        fasta_path: FASTA holding the full-length sequence of every variant.
+        target_column: column holding the regression target (enrichment or
+            production fitness).
+        sequence_column: column holding the full-length capsid sequence.
+
+    Rows whose sequence is absent from the FASTA are dropped, so the CSV and
+    FASTA act as a cross-check on each other.
+    """
+
+    def __init__(self, csv_path, fasta_path, target_column, sequence_column):
+        self.data = pd.read_csv(csv_path)
+        self.fasta_dict = read_fasta(fasta_path)
+        self.target_column = target_column
+        self.sequence_column = sequence_column
+
+        # Reverse lookup built once; the original per-item linear scan over the
+        # FASTA made __getitem__ O(N) in the number of sequences.
+        self.seq_to_acc = {}
+        for acc, seq in self.fasta_dict.items():
+            self.seq_to_acc.setdefault(seq, acc)
+
+        n_before = len(self.data)
+        self.data = self.data[
+            self.data[sequence_column].isin(self.seq_to_acc)
+        ].reset_index(drop=True)
+        n_dropped = n_before - len(self.data)
+
+        print(f"Loaded {len(self.data)} samples from {csv_path}")
+        if n_dropped:
+            print(f"  ({n_dropped} rows dropped: sequence not found in FASTA)")
+        if len(self.data) == 0:
+            raise ValueError(
+                f"No usable rows in {csv_path}. Check that '{sequence_column}' "
+                f"matches the sequences in {fasta_path}."
+            )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        sequence = row[self.sequence_column]
+        target = float(row[self.target_column])
+        acc = self.seq_to_acc.get(sequence, f"seq_{idx}")
+        return acc, sequence, target
+
+
+def collate_fn(batch):
+    accs, seqs, targets = zip(*batch)
+    return list(accs), list(seqs), torch.tensor(targets, dtype=torch.float32)
+
+
+def build_dataloaders(args, drop_last_train=False, num_workers=2):
+    """Build train/val/test loaders after checking that every input exists."""
+    missing = [
+        p for p in (args.train_csv, args.val_csv, args.test_csv, args.fasta_path)
+        if not os.path.exists(p)
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Input files not found:\n  - "
+            + "\n  - ".join(missing)
+            + "\nSet --train_csv/--val_csv/--test_csv/--fasta_path accordingly."
+        )
+
+    splits = {}
+    for name, csv_path in (
+        ("train", args.train_csv),
+        ("val", args.val_csv),
+        ("test", args.test_csv),
+    ):
+        splits[name] = ProteinDataset(
+            csv_path, args.fasta_path, args.target_column, args.sequence_column
+        )
+
+    common = dict(
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    train_loader = DataLoader(
+        splits["train"], shuffle=True, drop_last=drop_last_train, **common
+    )
+    val_loader = DataLoader(splits["val"], shuffle=False, drop_last=False, **common)
+    test_loader = DataLoader(splits["test"], shuffle=False, drop_last=False, **common)
+    return train_loader, val_loader, test_loader
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def regression_metrics(y_true, y_pred):
+    """R2, RMSE and MAE, matching the metrics reported in the manuscript.
+
+    R2 is the coefficient of determination (``sklearn.metrics.r2_score``), not
+    the squared Pearson correlation. The two differ whenever predictions are
+    biased, so the same definition is used everywhere in this repository.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "r2": float(r2_score(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+    }
+
+
+def format_metrics(name, metrics):
+    return (
+        f"{name:>10}: R2 = {metrics['r2']:.4f}, "
+        f"RMSE = {metrics['rmse']:.4f}, MAE = {metrics['mae']:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training history
+# ---------------------------------------------------------------------------
+
+def new_history():
+    return {
+        "train_loss": [], "val_loss": [],
+        "train_r2": [], "val_r2": [],
+        "train_mae": [], "val_mae": [],
+        "lr": [],
+    }
+
+
+def update_history(history, train_metrics, val_metrics, lr):
+    history["train_loss"].append(train_metrics["loss"])
+    history["val_loss"].append(val_metrics["loss"])
+    history["train_r2"].append(train_metrics["r2"])
+    history["val_r2"].append(val_metrics["r2"])
+    history["train_mae"].append(train_metrics["mae"])
+    history["val_mae"].append(val_metrics["mae"])
+    history["lr"].append(lr)
+
+
+def save_training_history(history, save_dir, filename="training_history.csv"):
+    os.makedirs(save_dir, exist_ok=True)
+    df = pd.DataFrame(history)
+    df.insert(0, "epoch", np.arange(1, len(df) + 1))
+    full_path = os.path.join(save_dir, filename)
+    df.to_csv(full_path, index=False)
+    print(f"Training history saved to: {full_path}")
+    return full_path
+
+
+def save_metrics_json(metrics, save_dir, filename="metrics.json"):
+    os.makedirs(save_dir, exist_ok=True)
+    full_path = os.path.join(save_dir, filename)
+    with open(full_path, "w") as handle:
+        json.dump(metrics, handle, indent=2)
+    print(f"Metrics saved to: {full_path}")
+    return full_path
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+def plot_training_curves(history, save_dir, experiment_name="",
+                         filename="training_curves.png"):
+    """Loss / R2 / MAE / learning-rate curves with the best epoch marked."""
+    os.makedirs(save_dir, exist_ok=True)
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+    best_epoch = int(np.argmin(history["val_loss"])) + 1
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    if experiment_name:
+        fig.suptitle(f"Training curves - {experiment_name}", fontsize=15, y=0.98)
+
+    panels = [
+        (axes[0, 0], "train_loss", "val_loss", "Loss (MSE)", "Loss", True),
+        (axes[0, 1], "train_r2", "val_r2", "R2 score", "R2", False),
+        (axes[1, 0], "train_mae", "val_mae", "Mean absolute error", "MAE", False),
+    ]
+    for ax, train_key, val_key, ylabel, title, log_scale in panels:
+        ax.plot(epochs, history[train_key], "b-", linewidth=2, label=f"Train {title}")
+        ax.plot(epochs, history[val_key], "r-", linewidth=2, label=f"Val {title}")
+        ax.axvline(best_epoch, color="green", linestyle="--", alpha=0.7,
+                   label=f"Best epoch ({best_epoch})")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"Training and validation {title}")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        if log_scale:
+            ax.set_yscale("log")
+
+    ax = axes[1, 1]
+    ax.plot(epochs, history["lr"], "g-", linewidth=2)
+    ax.axvline(best_epoch, color="green", linestyle="--", alpha=0.7)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate")
+    ax.set_title("Learning rate schedule")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    full_path = os.path.join(save_dir, filename)
+    plt.savefig(full_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Training curves saved to: {full_path}")
+    return full_path
+
+
+def plot_parity(y_true, y_pred, save_dir, dataset_name="Test", experiment_name=""):
+    """Parity plot with marginal histograms and KDEs (manuscript Fig. 4a/5a)."""
+    os.makedirs(save_dir, exist_ok=True)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    metrics = regression_metrics(y_true, y_pred)
+
+    fig = plt.figure(figsize=(12, 12))
+    gs = fig.add_gridspec(3, 3, width_ratios=[1, 4, 1], height_ratios=[1, 4, 1],
+                          hspace=0, wspace=0)
+    ax_main = fig.add_subplot(gs[1, 1])
+    ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
+    ax_right = fig.add_subplot(gs[1, 2], sharey=ax_main)
+
+    lo = min(y_true.min(), y_pred.min())
+    hi = max(y_true.max(), y_pred.max())
+    buffer = (hi - lo) * 0.05
+    plot_min, plot_max = lo - buffer, hi + buffer
+    bins = np.linspace(plot_min, plot_max, 101)
+
+    ax_main.scatter(y_true, y_pred, c="blue", alpha=0.6, edgecolors="w", s=50,
+                    label=f"{dataset_name} predictions")
+    ax_main.plot([plot_min, plot_max], [plot_min, plot_max], "k--",
+                 linewidth=2, alpha=0.8, label="y = x")
+    ax_main.text(
+        plot_min + (plot_max - plot_min) * 0.05,
+        plot_max - (plot_max - plot_min) * 0.18,
+        f"{dataset_name} data\nN: {len(y_true)}\n"
+        f"$R^2$: {metrics['r2']:.4f}\nRMSE: {metrics['rmse']:.4f}\n"
+        f"MAE: {metrics['mae']:.4f}",
+        fontsize=12, bbox=dict(facecolor="white", alpha=0.8),
+    )
+    ax_main.set_xlabel("True values", fontsize=14)
+    ax_main.set_ylabel("Predicted values", fontsize=14)
+    ax_main.set_xlim(plot_min, plot_max)
+    ax_main.set_ylim(plot_min, plot_max)
+    ax_main.legend(loc="lower right")
+
+    grid = np.linspace(plot_min, plot_max, 200)
+    ax_top.hist(y_true, bins=bins, density=True, alpha=0.7,
+                color="lightblue", edgecolor="black", linewidth=0.5)
+    ax_right.hist(y_pred, bins=bins, density=True, alpha=0.7, color="lightblue",
+                  edgecolor="black", linewidth=0.5, orientation="horizontal")
+    for values, axis, horizontal in ((y_true, ax_top, False), (y_pred, ax_right, True)):
+        # A KDE needs a non-degenerate spread; skip it rather than fail the plot.
+        if np.ptp(values) > 0:
+            density = gaussian_kde(values)(grid)
+            if horizontal:
+                axis.plot(density, grid, "b-", linewidth=2)
+            else:
+                axis.plot(grid, density, "b-", linewidth=2)
+
+    ax_top.set_xlim(plot_min, plot_max)
+    ax_top.tick_params(axis="x", labelbottom=False)
+    ax_top.set_yticks([])
+    ax_right.set_ylim(plot_min, plot_max)
+    ax_right.tick_params(axis="y", labelleft=False)
+    ax_right.set_xticks([])
+    for axis in (ax_top, ax_right):
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+
+    title = "Parity plot"
+    if experiment_name:
+        title += f" - {experiment_name}"
+    fig.suptitle(title, fontsize=16, y=0.95)
+
+    filename = f"parity_plot_{dataset_name.lower()}.png"
+    full_path = os.path.join(save_dir, filename)
+    plt.savefig(full_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Parity plot saved to: {full_path}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Prediction export
+# ---------------------------------------------------------------------------
+
+def save_predictions_csv(accs, seqs, y_true, y_pred, save_dir,
+                         filename="test_predictions.csv", embeddings=None):
+    """Write per-variant predictions, with optional pooled embeddings."""
+    os.makedirs(save_dir, exist_ok=True)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    data = {
+        "protein_id": accs,
+        "sequence": seqs,
+        "true_value": y_true,
+        "predicted_value": y_pred,
+        "sequence_length": [len(seq) for seq in seqs],
+        "prediction_error": y_pred - y_true,
+        "absolute_error": np.abs(y_pred - y_true),
+        "squared_error": (y_pred - y_true) ** 2,
+    }
+    if embeddings is not None:
+        embeddings = np.asarray(embeddings)
+        print(f"Including embeddings in CSV (shape: {embeddings.shape})")
+        for i in range(embeddings.shape[1]):
+            data[f"embedding_{i}"] = embeddings[:, i]
+
+    df = pd.DataFrame(data)
+    full_path = os.path.join(save_dir, filename)
+    df.to_csv(full_path, index=False)
+
+    metrics = regression_metrics(y_true, y_pred)
+    print(f"Saved {len(df)} predictions to: {full_path}")
+    print("  " + format_metrics("test", metrics))
+    return df, metrics
