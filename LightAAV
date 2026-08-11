@@ -1,730 +1,848 @@
-"""LightAAV: residual light attention regression on ESM2 per-residue embeddings.
-
-Per-residue ESM2 embeddings are fed to a residual light-attention head
-(Gado et al., 2025) that applies local attention over the sequence and pools it
-into a variant-level prediction. The ESM2 encoder can optionally be adapted
-with LoRA adapters on selected transformer layers.
-
-Usage:
-    python src/lightaav.py --target_column striatum_enrichment
-    python src/lightaav.py --finetune_esm --lora_target_layers 29 30 31 32
-"""
-
-import argparse
-import json
-import os
-import re
-import sys
-import warnings
-
-import esm
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import random
 import tqdm
+import argparse
+import os
+import sys
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from scipy.stats import gaussian_kde
+import json
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import common  # noqa: E402
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
+import esm
 
-try:
-    from peft import (
-        LoraConfig,
-        TaskType,
-        get_peft_model,
-        get_peft_model_state_dict,
-        set_peft_model_state_dict,
-    )
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
+sys.path.insert(1, './')
+from training import nn_models
 
-try:
-    # ResidualLightAttention is provided by the EpHod reference implementation;
-    # see README for how to make it importable.
-    from training import nn_models
-except ImportError as exc:  # pragma: no cover - depends on user environment
-    raise ImportError(
-        "Could not import 'training.nn_models'. LightAAV reuses the "
-        "ResidualLightAttention head from EpHod; clone that repository and add "
-        "it to PYTHONPATH (see README, 'External dependencies')."
-    ) from exc
+plt.style.use('default')
+sns.set_palette("husl")
 
-# LightAAV is defined on ESM2; its per-residue width and final layer index.
-ESM_MODEL = "esm2_t12_35M_UR50D"
-ESM_EMBED_DIM = 1280
-ESM_REPR_LAYER = 33
 
-# Friendly LoRA target names mapped onto ESM2 submodule names.
-LORA_MODULE_ALIASES = {
-    "query": "q_proj",
-    "key": "k_proj",
-    "value": "v_proj",
-    "dense": "out_proj",
-    "out_proj": "out_proj",
-    "intermediate": "fc1",
-    "output": "fc2",
-    "fc1": "fc1",
-    "fc2": "fc2",
-}
-ATTENTION_MODULES = {"q_proj", "k_proj", "v_proj", "out_proj"}
+# ===============================
+# ESM2 CONFIGURATION
+# ===============================
+# facebook/esm2_t12_35M_UR50D : 12 transformer layers, 480-dim representations
+ESM2_MODEL_NAME = 'facebook/esm2_t12_35M_UR50D'
+ESM2_REPR_LAYER = 12
+ESM2_EMBED_DIM = 480
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Train LightAAV for AAV capsid property prediction"
-    )
+    parser = argparse.ArgumentParser(description="Train LAT model for enzyme property prediction")
 
-    # Data
-    parser.add_argument("--train_csv", type=str, default="data/train.csv")
-    parser.add_argument("--val_csv", type=str, default="data/valid.csv")
-    parser.add_argument("--test_csv", type=str, default="data/test.csv")
-    parser.add_argument("--fasta_path", type=str, default="data/sequences.fasta",
-                        help="FASTA of full-length capsid sequences")
-    parser.add_argument("--target_column", type=str, required=True,
-                        help="Regression target column in the CSV files")
-    parser.add_argument("--sequence_column", type=str, default="full_sequence")
+    # Training specific arguments
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'predict', 'extract_attention'],
+                        help='Mode: train, predict, or extract_attention')
+    parser.add_argument('--train_csv', type=str,
+                        default='/workspace/topten_full/top3_full_train.csv',
+                        help='Path to training CSV file')
+    parser.add_argument('--val_csv', type=str,
+                        default='/workspace/topten_full/top3_full_valid.csv',
+                        help='Path to validation CSV file')
+    parser.add_argument('--test_csv', type=str,
+                        default='/workspace/topten_full/top3_full_test.csv',
+                        help='Path to test CSV file')
+    parser.add_argument('--target_column', type=str, default='Result_32_9_R2_IV_STR_count',
+                        help='Target column name in CSV')
+    parser.add_argument('--sequence_column', type=str, default='full_sequence',
+                        help='Sequence column name in CSV')
 
-    # Optimisation
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--min_epoch", type=int, default=80,
-                        help="Early stopping is only considered after this epoch")
-    parser.add_argument("--max_epoch", type=int, default=400)
-    parser.add_argument("--lr", type=float, default=5e-5,
-                        help="Learning rate for the residual light attention head")
-    parser.add_argument("--weight_decay", type=float, default=5e-5)
-    parser.add_argument("--patience", type=int, default=15,
-                        help="Early stopping patience")
-    parser.add_argument("--lr_factor", type=float, default=0.7,
-                        help="ReduceLROnPlateau decay factor")
-    parser.add_argument("--lr_patience", type=int, default=10,
-                        help="ReduceLROnPlateau patience")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    # Training hyperparameters
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training')
+    parser.add_argument('--min_epoch', type=int, default=80,
+                        help='Minimum number of epochs to train')
+    parser.add_argument('--max_epoch', type=int, default=400,
+                        help='Maximum number of epochs to train')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Learning rate for RLAT model')
+    parser.add_argument('--weight_decay', type=float, default=5e-5,
+                        help='Weight decay')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience (only applied after min_epoch)')
 
-    # Architecture
-    parser.add_argument("--kernel_size", type=int, default=7)
-    parser.add_argument("--res_blocks", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--activation", type=str, default="elu")
+    # ESM2 fine-tuning arguments
+    parser.add_argument('--finetune_esm', action='store_true',
+                        help='Enable ESM2 model fine-tuning')
+    parser.add_argument('--esm_lr', type=float, default=1e-5,
+                        help='Learning rate for ESM2 model (should be lower than RLAT lr)')
+    parser.add_argument('--esm_weight_decay', type=float, default=1e-5,
+                        help='Weight decay for ESM2 model')
+    parser.add_argument('--unfreeze_top', type=int, default=2,
+                        help='If set, unfreezes top N transformer layers and output heads; others frozen.')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='Number of epochs to warmup before full ESM2 fine-tuning')
 
-    # LoRA fine-tuning of the ESM2 encoder
-    parser.add_argument("--finetune_esm", action="store_true",
-                        help="Adapt the ESM2 encoder with LoRA adapters")
-    parser.add_argument("--esm_lr", type=float, default=1e-5)
-    parser.add_argument("--esm_weight_decay", type=float, default=1e-4)
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.1)
-    parser.add_argument("--lora_target_modules", type=str, nargs="+",
-                        default=["query", "key", "value", "out_proj"],
-                        choices=sorted(LORA_MODULE_ALIASES),
-                        help="Which projections receive LoRA adapters")
-    parser.add_argument("--lora_target_layers", type=int, nargs="+", default=None,
-                        help="Transformer layer indices to adapt "
-                             "(e.g. 29 30 31 32). Default: all layers.")
-    parser.add_argument("--lora_bias", type=str, default="none",
-                        choices=["none", "all", "lora_only"])
-    parser.add_argument("--warmup_epochs", type=int, default=5,
-                        help="Epochs training the head only before LoRA is enabled")
+    # Attention extraction arguments
+    parser.add_argument('--extract_attention', action='store_true',
+                        help='Extract attention scores after training')
+    parser.add_argument('--attention_output_dir', type=str, default='attention_analysis',
+                        help='Directory to save attention analysis results')
+    parser.add_argument('--attention_mode', type=str, default='average', choices=['average', 'max'],
+                        help='How to aggregate attention across heads')
 
-    # Outputs
-    parser.add_argument("--save_dir", type=str, default="results/lightaav")
-    parser.add_argument("--save_embeddings", action="store_true",
-                        help="Include pooled embeddings in the predictions CSV")
-    parser.add_argument("--extract_attention", action="store_true",
-                        help="Write per-residue attention scores for the test set")
-    parser.add_argument("--attention_mode", type=str, default="average",
-                        choices=["average", "max"],
-                        help="How to aggregate attention across heads")
+    # Paths
+    parser.add_argument('--fasta_path', type=str,
+                        default='/workspace/26000_sequences.fasta',
+                        help='Path to fasta file of enzyme sequences')
+    parser.add_argument('--save_dir', type=str, default='./12esm0.111e-4',
+                        help='Directory to which results will be written')
+    parser.add_argument('--verbose', default=1, type=int,
+                        help='Whether to print out progress to terminal')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to saved checkpoint (used in predict / extract_attention mode)')
 
     args = parser.parse_args()
 
     if args.min_epoch > args.max_epoch:
-        raise ValueError(
-            f"min_epoch ({args.min_epoch}) cannot exceed max_epoch ({args.max_epoch})"
-        )
-    if args.finetune_esm:
-        if not PEFT_AVAILABLE:
-            raise ValueError(
-                "LoRA fine-tuning requires the 'peft' package: pip install peft"
-            )
-        if args.lora_alpha < args.lora_rank:
-            print(f"Warning: lora_alpha ({args.lora_alpha}) < lora_rank "
-                  f"({args.lora_rank}); adaptation strength will be reduced.")
+        raise ValueError(f"min_epoch ({args.min_epoch}) cannot be greater than max_epoch ({args.max_epoch})")
+
+    if args.finetune_esm and args.esm_lr > args.lr:
+        print("Warning: ESM learning rate is higher than RLAT learning rate. This is unusual.")
+
     return args
 
 
-def resolve_lora_targets(module_names, target_layers):
-    """Expand friendly module names into PEFT target-module patterns."""
-    resolved = []
-    for name in module_names:
-        module = LORA_MODULE_ALIASES[name]
-        if target_layers is None:
-            # PEFT matches bare suffixes across every layer.
-            resolved.append(module)
-        else:
-            for layer_idx in target_layers:
-                prefix = f"layers.{layer_idx}"
-                if module in ATTENTION_MODULES:
-                    resolved.append(f"{prefix}.self_attn.{module}")
+def replace_noncanonical(seq, replace_char='X'):
+    '''Replace all non-canonical amino acids with a specific character'''
+    for char in ['B', 'J', 'O', 'U', 'Z']:
+        seq = seq.replace(char, replace_char)
+    return seq
+
+
+def make_masks(seqs, maxlen, device):
+    '''Build padding masks [batch, maxlen] for a list of sequences'''
+    masks = [[1] * len(seq) + [0] * (maxlen - len(seq)) for seq in seqs]
+    return torch.tensor(masks, dtype=torch.int32).to(device)
+
+
+class ProteinDataset(Dataset):
+    """Dataset for protein sequences and targets for training"""
+
+    def __init__(self, csv_path, fasta_path, target_column, sequence_column):
+        self.data = pd.read_csv(csv_path)
+        self.fasta_dict = self.read_fasta(fasta_path)
+        self.target_column = target_column
+        self.sequence_column = sequence_column
+
+        # Filter data to only include sequences present in FASTA
+        self.data = self.data[self.data[sequence_column].isin(self.fasta_dict.values())].reset_index(drop=True)
+        print(f"Loaded {len(self.data)} samples from {csv_path}")
+
+    def read_fasta(self, fasta_path):
+        """Read FASTA file and return dict"""
+        fasta_dict = {}
+        with open(fasta_path, 'r') as f:
+            header = None
+            for line in f:
+                if line.startswith('>'):
+                    header = line.strip()[1:].split()[0]  # Get accession
+                    fasta_dict[header] = ''
                 else:
-                    resolved.append(f"{prefix}.{module}")
-    return sorted(set(resolved))
+                    if header:
+                        fasta_dict[header] += line.strip()
+        return fasta_dict
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        sequence = row[self.sequence_column]
+        target = float(row[self.target_column])
+
+        # Find accession for this sequence
+        acc = None
+        for k, v in self.fasta_dict.items():
+            if v == sequence:
+                acc = k
+                break
+
+        if acc is None:
+            acc = f"seq_{idx}"
+
+        return acc, sequence, target
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
+def collate_fn(batch):
+    """Custom collate function for DataLoader"""
+    accs, seqs, targets = zip(*batch)
+    targets = torch.tensor(targets, dtype=torch.float32)
+    return list(accs), list(seqs), targets
 
-class LightAAVModel:
-    """ESM2 encoder (optionally LoRA-adapted) plus a light-attention head.
 
-    This is a plain container rather than an ``nn.Module`` because the encoder
-    and the head are optimised with separate parameter groups and learning
-    rates; ``is_training`` mirrors what ``nn.Module.training`` would give.
-    """
+class AttentionExtractor:
+    """Class for extracting and analyzing attention scores"""
 
-    def __init__(self, args, device):
-        self.args = args
+    def __init__(self, model, device, attention_mode='average'):
+        self.model = model
         self.device = device
-        self.is_training = True
-        self.finetune_esm = args.finetune_esm
-        self.lora_model = None
+        self.attention_mode = attention_mode
 
-        self.esm_model, self.esm_batch_converter = self._load_esm()
-        self.head = self._init_head()
+    def extract_attention_scores_batch(self, accs, seqs):
+        """Extract attention scores for a batch of sequences"""
+        self.model.rlat_model.eval()
+        self.model.esm_model.eval()
+
+        all_attention_scores = []
+        all_sequence_info = []
+
+        with torch.no_grad():
+            # Get ESM2 embeddings and RLAT predictions with attention
+            emb = self.model.get_ESM_embeddings(accs, seqs)
+            masks = make_masks(seqs, emb.shape[-1], self.device)
+
+            # Forward pass through RLAT to get attention weights
+            pred, embeddings, attention_weights = self.model.rlat_model(emb, masks)
+
+            # Process attention weights for each sequence
+            for i, (acc, seq) in enumerate(zip(accs, seqs)):
+                seq_len = len(seq)
+
+                # Get attention weights for this sequence (excluding padding)
+                seq_attention = attention_weights[i, :, :seq_len]  # [heads, seq_len]
+
+                # Average or max across attention heads
+                if self.attention_mode == 'max':
+                    aggregated_attention = seq_attention.max(dim=0)[0]
+                else:
+                    aggregated_attention = seq_attention.mean(dim=0)
+
+                # Normalize attention scores
+                attention_scores = aggregated_attention.cpu().numpy()
+                if attention_scores.max() > attention_scores.min():
+                    attention_scores = (attention_scores - attention_scores.min()) / \
+                                    (attention_scores.max() - attention_scores.min())
+
+                # Store per-residue information
+                for pos, (residue, score) in enumerate(zip(seq, attention_scores)):
+                    all_attention_scores.append({
+                        'protein_id': acc,
+                        'position': pos + 1,  # 1-indexed
+                        'residue': residue,
+                        'attention_score': float(score),
+                        'sequence_length': seq_len
+                    })
+
+                # Store sequence-level information
+                all_sequence_info.append({
+                    'protein_id': acc,
+                    'sequence': seq,
+                    'sequence_length': seq_len,
+                    'mean_attention': float(attention_scores.mean()),
+                    'max_attention': float(attention_scores.max()),
+                    'min_attention': float(attention_scores.min()),
+                    'std_attention': float(attention_scores.std())
+                })
+
+        return all_attention_scores, all_sequence_info
+
+    def extract_from_dataset(self, dataset, batch_size=8, attention_mode=None):
+        """Extract attention scores from entire dataset"""
+        if attention_mode is not None:
+            self.attention_mode = attention_mode
+
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+        all_attention_data = []
+        all_sequence_data = []
+
+        print(f"Extracting attention scores using {self.attention_mode} aggregation...")
+
+        for accs, seqs, targets in tqdm.tqdm(dataloader, desc="Extracting attention"):
+            batch_attention, batch_sequences = self.extract_attention_scores_batch(accs, seqs)
+
+            all_attention_data.extend(batch_attention)
+            all_sequence_data.extend(batch_sequences)
+
+        return pd.DataFrame(all_attention_data), pd.DataFrame(all_sequence_data)
+
+    def analyze_attention_patterns(self, attention_df, sequence_df, output_dir):
+        """Analyze and visualize attention patterns"""
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"Analyzing attention patterns...")
+
+        # 1. Residue-level attention analysis
+        residue_attention = attention_df.groupby('residue')['attention_score'].agg([
+            'mean', 'std', 'count', 'min', 'max'
+        ]).reset_index()
+        residue_attention.to_csv(f'{output_dir}/residue_attention_analysis.csv', index=False)
+
+        # 2. Position-based attention analysis (positions normalized by sequence length)
+        attention_df['relative_position'] = attention_df['position'] / attention_df['sequence_length']
+        position_bins = np.linspace(0, 1, 21)  # 20 bins
+        attention_df['position_bin'] = pd.cut(attention_df['relative_position'],
+                                            bins=position_bins, labels=False)
+
+        position_attention = attention_df.groupby('position_bin')['attention_score'].agg([
+            'mean', 'std', 'count'
+        ]).reset_index()
+        position_attention.to_csv(f'{output_dir}/position_attention_analysis.csv', index=False)
+
+        # 3. Create visualizations
+        self._create_attention_visualizations(attention_df, sequence_df, residue_attention,
+                                            position_attention, output_dir)
+
+        # 4. Save summary statistics
+        summary_stats = {
+            'total_residues': len(attention_df),
+            'total_proteins': len(sequence_df),
+            'mean_attention_score': float(attention_df['attention_score'].mean()),
+            'std_attention_score': float(attention_df['attention_score'].std()),
+            'min_attention_score': float(attention_df['attention_score'].min()),
+            'max_attention_score': float(attention_df['attention_score'].max()),
+            'mean_sequence_length': float(sequence_df['sequence_length'].mean()),
+            'std_sequence_length': float(sequence_df['sequence_length'].std()),
+            'attention_mode': self.attention_mode
+        }
+
+        with open(f'{output_dir}/attention_summary.json', 'w') as f:
+            json.dump(summary_stats, f, indent=2)
+
+        print(f"Attention analysis saved to {output_dir}")
+        return summary_stats
+
+    def _create_attention_visualizations(self, attention_df, sequence_df, residue_attention,
+                                       position_attention, output_dir):
+        """Create attention visualization plots"""
+
+        # 1. Residue attention barplot
+        plt.figure(figsize=(15, 8))
+        residue_order = residue_attention.sort_values('mean', ascending=False)['residue']
+        sns.barplot(data=residue_attention, x='residue', y='mean', order=residue_order)
+        plt.title('Mean Attention Score by Residue Type')
+        plt.xlabel('Residue')
+        plt.ylabel('Mean Attention Score')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/residue_attention_barplot.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 2. Position-based attention
+        plt.figure(figsize=(12, 6))
+        position_centers = (position_attention.index + 0.5) / 20  # Convert bin index to relative position
+        plt.plot(position_centers, position_attention['mean'], 'o-', linewidth=2, markersize=6)
+        plt.fill_between(position_centers,
+                        position_attention['mean'] - position_attention['std'],
+                        position_attention['mean'] + position_attention['std'],
+                        alpha=0.3)
+        plt.xlabel('Relative Position in Sequence')
+        plt.ylabel('Mean Attention Score')
+        plt.title('Attention Score vs. Sequence Position')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/position_attention_plot.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 3. Attention distribution
+        plt.figure(figsize=(10, 6))
+        plt.hist(attention_df['attention_score'], bins=50, alpha=0.7, density=True)
+        plt.xlabel('Attention Score')
+        plt.ylabel('Density')
+        plt.title('Distribution of Attention Scores')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/attention_distribution.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 4. Sequence length vs attention correlation
+        plt.figure(figsize=(10, 6))
+        plt.scatter(sequence_df['sequence_length'], sequence_df['mean_attention'],
+                   alpha=0.6, s=30)
+        plt.xlabel('Sequence Length')
+        plt.ylabel('Mean Attention Score')
+        plt.title('Sequence Length vs. Mean Attention Score')
+        plt.grid(True, alpha=0.3)
+
+        corr = np.corrcoef(sequence_df['sequence_length'], sequence_df['mean_attention'])[0, 1]
+        plt.text(0.05, 0.95, f'Correlation: {corr:.3f}', transform=plt.gca().transAxes,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/length_vs_attention.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+class LATModel():
+    """ESM2 + RLAT model with optional ESM2 fine-tuning"""
+
+    def __init__(self, seed=0, training_mode=False, finetune_esm=False, args=None):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if self.device != 'cuda':
+            print('WARNING: You are not using a GPU. Training/Inference will be slow')
+
+        self.training = training_mode
+        self.finetune_esm = finetune_esm
+        self.args = args  # Store args for access in setup_esm_finetuning
+
+        self.set_seed(seed=seed)
+        self.esm_model, self.esm_batch_converter = self.load_ESM2_model()
+
+        # RLAT head is always initialized fresh; for predict/extract modes load a
+        # checkpoint afterwards with load_model(). (The upstream pretrained RLAT/SVR
+        # weights are ESM1v-1280d and are not compatible with ESM2-480d.)
+        self.rlat_model = self.init_RLAT_model()
+
+        if training_mode:
+            print("Initialized RLAT model for training")
+            if self.finetune_esm:
+                self.setup_esm_finetuning()
+        else:
+            self.rlat_model.eval()
+
+        if not self.finetune_esm:
+            self.esm_model.eval()
+
+    def set_seed(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if self.device == 'cuda':
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def load_ESM2_model(self):
+        '''Return pretrained ESM2 (t12, 35M) model weights and batch converter'''
+        model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
+        model = model.to(self.device)
+        batch_converter = alphabet.get_batch_converter()
+        print(f"Loaded ESM model: {ESM2_MODEL_NAME} "
+              f"(layer {ESM2_REPR_LAYER}, dim {ESM2_EMBED_DIM})")
+        return model, batch_converter
+
+    def setup_esm_finetuning(self):
+        print(f"Setting up ESM2 fine-tuning for TOP layers...")
+
+        # Start with all parameters frozen
+        for p in self.esm_model.parameters():
+            p.requires_grad = False
+
+        num_layers = len(self.esm_model.layers)
+
+        if self.args and self.args.unfreeze_top is not None:
+            n = max(0, min(self.args.unfreeze_top, num_layers))
+
+            # Unfreeze output heads (language model head, contact prediction head, etc.)
+            for head_name in ['lm_head', 'contact_head']:
+                head = getattr(self.esm_model, head_name, None)
+                if head is not None:
+                    for p in head.parameters():
+                        p.requires_grad = True
+
+            # Unfreeze top n transformer layers (highest indices)
+            for i in range(num_layers - n, num_layers):
+                for p in self.esm_model.layers[i].parameters():
+                    p.requires_grad = True
+
+            print(f"  - Unfrozen: output heads + top {n} layers "
+                  f"(layers {num_layers-n} to {num_layers-1}); others frozen.")
+        else:
+            # Default: unfreeze all layers if finetune_esm is enabled but unfreeze_top is not set
+            for p in self.esm_model.parameters():
+                p.requires_grad = True
+            print(f"  - All ESM2 parameters unfrozen for fine-tuning")
+
+    def get_ESM_embeddings(self, accs, seqs, return_attention=False):
+        '''Return per-residue embeddings (padded) for protein sequences from ESM2'''
+        seqs = [replace_noncanonical(seq, 'X') for seq in seqs]
+        data = [(accs[i], seqs[i]) for i in range(len(accs))]
+
+        batch_labels, batch_strs, batch_tokens = self.esm_batch_converter(data)
+        batch_tokens = batch_tokens.to(device=self.device, non_blocking=True)
+
+        # Gradients only flow when actually fine-tuning ESM2 during training
+        with torch.set_grad_enabled(self.finetune_esm and self.training):
+            result = self.esm_model(batch_tokens, repr_layers=[ESM2_REPR_LAYER],
+                                    return_contacts=False)
+
+        emb = result["representations"][ESM2_REPR_LAYER]
+        emb = emb.transpose(2, 1)  # From (batch, seqlen, features) to (batch, features, seqlen)
+
+        if return_attention:
+            return emb, result.get("attentions", None)
+        return emb
+
+    def init_RLAT_model(self):
+        '''Initialize fresh RLAT model matching the ESM2 embedding dimension'''
+        model = nn_models.ResidualLightAttention(
+            dim=ESM2_EMBED_DIM, kernel_size=7, dropout=0.1, res_blocks=4, activation='elu'
+        )
+        return model.to(self.device)
+
+    def predict(self, accs, seqs):
+        '''Predict with the ESM2 + RLAT model'''
+        self.training = False
+        emb = self.get_ESM_embeddings(accs, seqs)
+        masks = make_masks(seqs, emb.shape[-1], self.device)
+
+        with torch.no_grad():
+            out = self.rlat_model(emb, masks)
+        rlat_pred, rlat_emb, rlat_attn = [item.cpu().numpy() for item in out]
+
+        return dict(rlat_pred=rlat_pred, rlat_emb=rlat_emb, rlat_attn=rlat_attn)
+
+    def _run_epoch(self, dataloader, criterion, optimizer=None, warmup_phase=False):
+        """Shared train/validation epoch loop.
+
+        optimizer=None -> evaluation pass (no grads, no updates).
+        """
+        is_train = optimizer is not None
+        self.training = is_train
+
+        finetuning_now = is_train and self.finetune_esm and not warmup_phase
+        self.esm_model.train() if finetuning_now else self.esm_model.eval()
+        self.rlat_model.train() if is_train else self.rlat_model.eval()
+
+        total_loss = 0
+        predictions = []
+        targets = []
+
+        desc = f"Training {'(Warmup)' if warmup_phase else ''}" if is_train else "Validation"
+        pbar = tqdm.tqdm(dataloader, desc=desc)
+
+        with torch.set_grad_enabled(is_train):
+            for accs, seqs, batch_targets in pbar:
+                batch_targets = batch_targets.to(self.device)
+
+                emb = self.get_ESM_embeddings(accs, seqs)
+                masks = make_masks(seqs, emb.shape[-1], self.device)
+
+                if is_train:
+                    optimizer.zero_grad()
+
+                pred = self.rlat_model(emb, masks)[0]  # outputs: [y, x, weights]
+                loss = criterion(pred, batch_targets)
+
+                postfix = {'loss': f'{loss.item():.4f}'}
+
+                if is_train:
+                    loss.backward()
+
+                    # Gradient clipping for stability when fine-tuning ESM2
+                    if finetuning_now:
+                        esm_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.esm_model.parameters(), max_norm=1.0)
+                        postfix['esm_grad'] = f'{esm_grad_norm:.2e}'
+                    torch.nn.utils.clip_grad_norm_(self.rlat_model.parameters(), max_norm=1.0)
+
+                    optimizer.step()
+
+                total_loss += loss.item()
+                predictions.extend(pred.detach().cpu().numpy())
+                targets.extend(batch_targets.cpu().numpy())
+                pbar.set_postfix(postfix)
+
+        avg_loss = total_loss / len(dataloader)
+        r2 = r2_score(targets, predictions)
+        mae = mean_absolute_error(targets, predictions)
+        mse = mean_squared_error(targets, predictions)
+
+        return avg_loss, r2, mae, mse, predictions, targets
+
+    def train_epoch(self, dataloader, optimizer, criterion, warmup_phase=False):
+        return self._run_epoch(dataloader, criterion, optimizer=optimizer, warmup_phase=warmup_phase)
+
+    def validate_epoch(self, dataloader, criterion):
+        return self._run_epoch(dataloader, criterion, optimizer=None)
+
+    def save_model(self, path, epoch, optimizer, train_loss, val_loss, train_r2, val_r2):
+        """Save model checkpoint including ESM2 if fine-tuned"""
+        checkpoint = {
+            'epoch': epoch,
+            'rlat_model_state_dict': self.rlat_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'train_r2': train_r2,
+            'val_r2': val_r2,
+            'esm_model_name': ESM2_MODEL_NAME,
+            'finetune_esm': self.finetune_esm,
+            'unfreeze_top': self.args.unfreeze_top if self.args else None
+        }
 
         if self.finetune_esm:
-            self._setup_lora()
-        else:
-            self.esm_model.eval()
-            for param in self.esm_model.parameters():
-                param.requires_grad = False
+            checkpoint['esm_model_state_dict'] = self.esm_model.state_dict()
 
-    # -- construction -------------------------------------------------------
-
-    def _load_esm(self):
-        model, alphabet = getattr(esm.pretrained, ESM_MODEL)()
-        model = model.to(self.device)
-        print(f"Loaded {ESM_MODEL} ({ESM_EMBED_DIM}-dim, layer {ESM_REPR_LAYER})")
-        return model, alphabet.get_batch_converter()
-
-    def _init_head(self):
-        head = nn_models.ResidualLightAttention(
-            dim=ESM_EMBED_DIM,
-            kernel_size=self.args.kernel_size,
-            dropout=self.args.dropout,
-            res_blocks=self.args.res_blocks,
-            activation=self.args.activation,
-        ).to(self.device)
-        n_params = sum(p.numel() for p in head.parameters())
-        print(f"Initialised residual light attention head ({n_params:,} parameters)")
-        return head
-
-    def _setup_lora(self):
-        target_layers = self.args.lora_target_layers
-        target_modules = resolve_lora_targets(
-            self.args.lora_target_modules, target_layers
-        )
-        print("Setting up LoRA on the ESM2 encoder")
-        print(f"  layers  : {target_layers if target_layers else 'all'}")
-        print(f"  modules : {target_modules[:5]}"
-              f"{'...' if len(target_modules) > 5 else ''} "
-              f"({len(target_modules)} total)")
-
-        lora_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=self.args.lora_rank,
-            lora_alpha=self.args.lora_alpha,
-            lora_dropout=self.args.lora_dropout,
-            target_modules=target_modules,
-            bias=self.args.lora_bias,
-            inference_mode=False,
-        )
-        self.lora_model = get_peft_model(self.esm_model, lora_config)
-
-        base = self.lora_model.get_base_model()
-        if base is None:
-            raise RuntimeError(
-                "Could not retrieve the base model from the PEFT wrapper; "
-                "check the installed peft version."
-            )
-        # Forward passes go through the LoRA-injected base model.
-        self.esm_model = base
-
-        if target_layers is not None:
-            frozen = 0
-            keep = set(target_layers)
-            for name, param in self.lora_model.named_parameters():
-                if "lora_" not in name:
-                    continue
-                match = re.search(r"layers\.(\d+)\.", name)
-                if match and int(match.group(1)) not in keep:
-                    param.requires_grad = False
-                    frozen += 1
-            if frozen:
-                print(f"  froze {frozen} LoRA parameters outside the target layers")
-
-        trainable = sum(p.numel() for p in self.lora_model.parameters()
-                        if p.requires_grad)
-        total = sum(p.numel() for p in self.lora_model.parameters())
-        if trainable == 0:
-            raise RuntimeError(
-                "No trainable LoRA parameters were injected. Check "
-                "--lora_target_modules against the ESM2 module names."
-            )
-        print(f"  trainable: {trainable:,} / {total:,} "
-              f"({100 * trainable / total:.2f}%)")
-
-    # -- mode switching -----------------------------------------------------
-
-    def train(self, warmup_phase=False):
-        self.is_training = True
-        self.head.train()
-        adapt_encoder = self.finetune_esm and not warmup_phase
-        if self.lora_model is not None:
-            self.lora_model.train(adapt_encoder)
-        self.esm_model.train(adapt_encoder)
-
-    def eval(self):
-        self.is_training = False
-        self.head.eval()
-        if self.lora_model is not None:
-            self.lora_model.eval()
-        self.esm_model.eval()
-
-    # -- forward ------------------------------------------------------------
-
-    def embed(self, accs, seqs):
-        """Per-residue ESM2 embeddings as ``[batch, features, max_len]``.
-
-        BOS/EOS tokens are stripped so that position 0 is the first residue,
-        which is what the mask built in :meth:`forward` assumes.
-        """
-        seqs = [common.replace_noncanonical(seq) for seq in seqs]
-        _, _, tokens = self.esm_batch_converter(list(zip(accs, seqs)))
-        tokens = tokens.to(self.device, non_blocking=True)
-
-        if self.finetune_esm and self.is_training:
-            out = self.esm_model(tokens, repr_layers=[ESM_REPR_LAYER],
-                                 return_contacts=False)
-        else:
-            with torch.no_grad():
-                out = self.esm_model(tokens, repr_layers=[ESM_REPR_LAYER],
-                                     return_contacts=False)
-
-        reps = out["representations"][ESM_REPR_LAYER]
-        max_len = max(len(seq) for seq in seqs)
-
-        padded = []
-        for i, seq in enumerate(seqs):
-            residues = reps[i, 1:1 + len(seq), :]
-            if len(seq) < max_len:
-                pad = torch.zeros(max_len - len(seq), residues.size(1),
-                                  device=residues.device, dtype=residues.dtype)
-                residues = torch.cat([residues, pad], dim=0)
-            padded.append(residues)
-
-        # The head expects channels-first input.
-        return torch.stack(padded, dim=0).transpose(2, 1)
-
-    def forward(self, accs, seqs):
-        """Return ``(prediction, pooled_embedding, attention_weights)``."""
-        embeddings = self.embed(accs, seqs)
-        max_len = embeddings.shape[-1]
-        masks = torch.tensor(
-            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in seqs],
-            dtype=torch.int32, device=self.device,
-        )
-        return self.head(embeddings, masks)
-
-    # -- parameters and checkpoints ----------------------------------------
-
-    def trainable_lora_parameters(self):
-        if self.lora_model is None:
-            return []
-        return [p for p in self.lora_model.parameters() if p.requires_grad]
-
-    def save(self, path, epoch, optimizer, train_metrics, val_metrics):
-        checkpoint = {
-            "epoch": epoch,
-            "head_state_dict": self.head.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics,
-            "esm_model": ESM_MODEL,
-            "finetune_esm": self.finetune_esm,
-            "args": vars(self.args),
-        }
-        if self.finetune_esm and self.lora_model is not None:
-            checkpoint["lora_state_dict"] = get_peft_model_state_dict(self.lora_model)
         torch.save(checkpoint, path)
 
-    def load(self, path):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.head.load_state_dict(checkpoint["head_state_dict"])
-        if checkpoint.get("finetune_esm") and "lora_state_dict" in checkpoint:
-            if self.lora_model is None:
-                raise RuntimeError(
-                    "Checkpoint contains LoRA adapters but this model was built "
-                    "without --finetune_esm. Re-run with the same LoRA settings."
-                )
-            set_peft_model_state_dict(self.lora_model, checkpoint["lora_state_dict"])
+    def load_model(self, path):
+        """Load model checkpoint"""
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.rlat_model.load_state_dict(checkpoint['rlat_model_state_dict'])
+
+        if checkpoint.get('finetune_esm', False) and 'esm_model_state_dict' in checkpoint:
+            print("Loading fine-tuned ESM2 model...")
+            self.esm_model.load_state_dict(checkpoint['esm_model_state_dict'])
+            self.finetune_esm = True
+
         return checkpoint
 
 
-# ---------------------------------------------------------------------------
-# Optimiser
-# ---------------------------------------------------------------------------
-
-def build_optimizers(model, args):
-    """Head-only optimiser for warmup, plus a combined one for LoRA training."""
-    head_optimizer = optim.AdamW(
-        model.head.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    optimizers = {"head": head_optimizer, "combined": head_optimizer}
+def get_optimizer(model, args):
+    """Create the optimizer (single param-group set covering RLAT + optionally ESM2)"""
+    param_groups = [{
+        'params': list(model.rlat_model.parameters()),
+        'lr': args.lr,
+        'weight_decay': args.weight_decay
+    }]
 
     if args.finetune_esm:
-        lora_params = model.trainable_lora_parameters()
-        if lora_params:
-            optimizers["combined"] = optim.AdamW([
-                {"params": list(model.head.parameters()),
-                 "lr": args.lr, "weight_decay": args.weight_decay},
-                {"params": lora_params,
-                 "lr": args.esm_lr, "weight_decay": args.esm_weight_decay},
-            ])
-    return optimizers
-
-
-# ---------------------------------------------------------------------------
-# Train / evaluate
-# ---------------------------------------------------------------------------
-
-def run_epoch(model, loader, criterion, args, optimizer=None,
-              warmup_phase=False, desc="Train"):
-    """One pass over ``loader``; an optimizer switches on training behaviour."""
-    is_train = optimizer is not None
-    if is_train:
-        model.train(warmup_phase=warmup_phase)
-    else:
-        model.eval()
-
-    total_loss = 0.0
-    predictions, targets = [], []
-
-    progress = tqdm.tqdm(loader, desc=desc)
-    with torch.set_grad_enabled(is_train):
-        for accs, seqs, batch_targets in progress:
-            batch_targets = batch_targets.to(model.device)
-
-            if is_train:
-                optimizer.zero_grad()
-            pred = model.forward(accs, seqs)[0]
-            loss = criterion(pred, batch_targets)
-
-            if is_train:
-                loss.backward()
-                if args.grad_clip > 0:
-                    if model.finetune_esm and not warmup_phase:
-                        lora_params = model.trainable_lora_parameters()
-                        if lora_params:
-                            nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
-                    nn.utils.clip_grad_norm_(model.head.parameters(), args.grad_clip)
-                optimizer.step()
-
-            total_loss += loss.item()
-            predictions.extend(pred.detach().cpu().numpy())
-            targets.extend(batch_targets.cpu().numpy())
-            progress.set_postfix({"loss": f"{loss.item():.4f}"})
-
-    metrics = common.regression_metrics(targets, predictions)
-    metrics["loss"] = total_loss / max(len(loader), 1)
-    return metrics
-
-
-@torch.no_grad()
-def collect_predictions(model, loader):
-    """Predictions, targets, pooled embeddings and identifiers for a split."""
-    model.eval()
-    preds, targets, embeddings, accs_all, seqs_all = [], [], [], [], []
-
-    for accs, seqs, batch_targets in loader:
-        pred, pooled, _ = model.forward(accs, seqs)
-        preds.extend(pred.cpu().numpy())
-        targets.extend(batch_targets.numpy())
-        embeddings.append(pooled.cpu().numpy())
-        accs_all.extend(accs)
-        seqs_all.extend(seqs)
-
-    return (np.asarray(preds), np.asarray(targets),
-            np.vstack(embeddings), accs_all, seqs_all)
-
-
-def train_model(model, train_loader, val_loader, args):
-    criterion = nn.MSELoss()
-    optimizers = build_optimizers(model, args)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizers["combined"], mode="min",
-        factor=args.lr_factor, patience=args.lr_patience,
-    )
-
-    history = common.new_history()
-    best_val_loss = float("inf")
-    patience_counter = 0
-    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
-
-    print(f"Training for {args.min_epoch}-{args.max_epoch} epochs "
-          f"(early stopping patience {args.patience})")
-
-    for epoch in range(1, args.max_epoch + 1):
-        warmup_phase = args.finetune_esm and epoch <= args.warmup_epochs
-        optimizer = optimizers["head"] if warmup_phase else optimizers["combined"]
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        label = " (warmup: head only)" if warmup_phase else ""
-        print(f"\nEpoch {epoch}/{args.max_epoch} (LR: {current_lr:.2e}){label}")
-
-        train_metrics = run_epoch(model, train_loader, criterion, args,
-                                  optimizer=optimizer, warmup_phase=warmup_phase,
-                                  desc="Training")
-        val_metrics = run_epoch(model, val_loader, criterion, args,
-                                desc="Validation")
-        if not warmup_phase:
-            scheduler.step(val_metrics["loss"])
-        common.update_history(history, train_metrics, val_metrics, current_lr)
-
-        print(f"Train - loss {train_metrics['loss']:.4f}, "
-              f"R2 {train_metrics['r2']:.4f}, MAE {train_metrics['mae']:.4f}")
-        print(f"Val   - loss {val_metrics['loss']:.4f}, "
-              f"R2 {val_metrics['r2']:.4f}, MAE {val_metrics['mae']:.4f}")
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            patience_counter = 0
-            model.save(checkpoint_path, epoch, optimizer, train_metrics, val_metrics)
-            print(f"New best model saved (val loss {best_val_loss:.4f})")
-        else:
-            patience_counter += 1
-
-        if epoch >= args.min_epoch and patience_counter >= args.patience:
-            print(f"Early stopping after {epoch} epochs")
-            break
-        if epoch < args.min_epoch:
-            print(f"Minimum epoch not reached ({epoch}/{args.min_epoch})")
-
-    return history, checkpoint_path
-
-
-# ---------------------------------------------------------------------------
-# Attention analysis
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def extract_attention_table(model, loader, save_dir, attention_mode="average"):
-    """Per-residue and per-sequence attention tables for a split."""
-    os.makedirs(save_dir, exist_ok=True)
-    model.eval()
-    residue_rows, sequence_rows = [], []
-
-    for accs, seqs, _ in tqdm.tqdm(loader, desc="Extracting attention"):
-        weights = model.forward(accs, seqs)[2]
-        for i, (acc, seq) in enumerate(zip(accs, seqs)):
-            per_head = weights[i, :, :len(seq)]
-            if attention_mode == "max":
-                scores = per_head.max(dim=0)[0]
-            else:
-                scores = per_head.mean(dim=0)
-            scores = scores.cpu().numpy()
-
-            spread = scores.max() - scores.min()
-            if spread > 0:
-                scores = (scores - scores.min()) / spread
-
-            for position, (residue, score) in enumerate(zip(seq, scores), start=1):
-                residue_rows.append({
-                    "protein_id": acc,
-                    "position": position,
-                    "residue": residue,
-                    "attention_score": float(score),
-                    "sequence_length": len(seq),
-                })
-            sequence_rows.append({
-                "protein_id": acc,
-                "sequence": seq,
-                "sequence_length": len(seq),
-                "mean_attention": float(scores.mean()),
-                "max_attention": float(scores.max()),
-                "std_attention": float(scores.std()),
+        esm_params = [p for p in model.esm_model.parameters() if p.requires_grad]
+        if esm_params:
+            param_groups.append({
+                'params': esm_params,
+                'lr': args.esm_lr,
+                'weight_decay': args.esm_weight_decay
             })
 
-    residue_df = pd.DataFrame(residue_rows)
-    sequence_df = pd.DataFrame(sequence_rows)
-    residue_df.to_csv(os.path.join(save_dir, "attention_per_residue.csv"), index=False)
-    sequence_df.to_csv(os.path.join(save_dir, "attention_per_sequence.csv"), index=False)
-    return residue_df, sequence_df
+    return optim.AdamW(param_groups)
 
 
-def analyze_attention(residue_df, sequence_df, save_dir, attention_mode="average"):
-    """Aggregate attention by residue type and relative position, and plot."""
-    os.makedirs(save_dir, exist_ok=True)
+def plot_parity_plot(true_values, pred_values, dataset_name, save_path, experiment_name=""):
+    true_values = np.array(true_values)
+    pred_values = np.array(pred_values)
 
-    by_residue = (
-        residue_df.groupby("residue")["attention_score"]
-        .agg(["mean", "std", "count", "min", "max"])
-        .reset_index()
-        .sort_values("mean", ascending=False)
-    )
-    by_residue.to_csv(os.path.join(save_dir, "residue_attention_analysis.csv"),
-                      index=False)
+    os.makedirs(save_path, exist_ok=True)
 
-    bins = np.linspace(0, 1, 21)
-    residue_df = residue_df.copy()
-    residue_df["relative_position"] = (
-        residue_df["position"] / residue_df["sequence_length"]
-    )
-    residue_df["position_bin"] = pd.cut(residue_df["relative_position"],
-                                        bins=bins, labels=False)
-    by_position = (
-        residue_df.groupby("position_bin")["attention_score"]
-        .agg(["mean", "std", "count"])
-        .reset_index()
-        .dropna(subset=["position_bin"])
-    )
-    by_position.to_csv(os.path.join(save_dir, "position_attention_analysis.csv"),
-                       index=False)
+    fig = plt.figure(figsize=(12, 12))
+    gs = fig.add_gridspec(3, 3, width_ratios=[1, 4, 1], height_ratios=[1, 4, 1],
+                         hspace=0, wspace=0)
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    ax_main = fig.add_subplot(gs[1, 1])
+    ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
+    ax_right = fig.add_subplot(gs[1, 2], sharey=ax_main)
 
-    axes[0].bar(by_residue["residue"], by_residue["mean"],
-                yerr=by_residue["std"], capsize=3, color="steelblue", alpha=0.85)
-    axes[0].set_xlabel("Residue")
-    axes[0].set_ylabel("Mean attention score")
-    axes[0].set_title("Attention by residue type")
-    axes[0].grid(True, axis="y", alpha=0.3)
+    min_val = min(min(true_values), min(pred_values))
+    max_val = max(max(true_values), max(pred_values))
 
-    bin_centers = 0.5 * (bins[:-1] + bins[1:])
-    if len(by_position):
-        centers = bin_centers[by_position["position_bin"].astype(int)]
-        axes[1].plot(centers, by_position["mean"], "o-", linewidth=2, markersize=5)
-        axes[1].fill_between(centers,
-                             by_position["mean"] - by_position["std"],
-                             by_position["mean"] + by_position["std"], alpha=0.3)
-    axes[1].set_xlabel("Relative position in sequence")
-    axes[1].set_ylabel("Mean attention score")
-    axes[1].set_title("Attention along the sequence")
-    axes[1].grid(True, alpha=0.3)
+    range_buffer = (max_val - min_val) * 0.05
+    plot_min = min_val - range_buffer
+    plot_max = max_val + range_buffer
 
-    axes[2].hist(residue_df["attention_score"], bins=50, alpha=0.75, density=True,
-                 color="steelblue")
-    axes[2].set_xlabel("Attention score")
-    axes[2].set_ylabel("Density")
-    axes[2].set_title("Attention score distribution")
-    axes[2].grid(True, alpha=0.3)
+    n_bins = 100
+    bins = np.linspace(plot_min, plot_max, n_bins+1)
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "attention_analysis.png"),
-                dpi=300, bbox_inches="tight")
+    ax_main.scatter(true_values, pred_values, c='blue', alpha=0.6, edgecolors='w',
+               s=50, label=f'{dataset_name} predictions')
+
+    ax_main.plot([plot_min, plot_max], [plot_min, plot_max], 'k--',
+                linewidth=2, label='y = x', alpha=0.8)
+
+    mse = np.mean((true_values - pred_values) ** 2)
+    mae = np.mean(np.abs(true_values - pred_values))
+    r2 = np.corrcoef(true_values, pred_values)[0, 1]**2 if len(set(true_values)) > 1 else 0.0
+    n_samples = len(true_values)
+    ax_main.text(plot_min + (plot_max - plot_min) * 0.05,
+                plot_max - (plot_max - plot_min) * 0.15,
+                 f'{dataset_name} data\nN: {n_samples}\nMAE: {mae:.4f}\n$R^2$: {r2:.4f}',
+                fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+
+    ax_main.set_xlabel('True Values', fontsize=14)
+    ax_main.set_ylabel('Predicted Values', fontsize=14)
+    ax_main.set_xlim(plot_min, plot_max)
+    ax_main.set_ylim(plot_min, plot_max)
+
+    ax_top.hist(true_values, bins=bins, density=True, alpha=0.7,
+               color='lightblue', edgecolor='black', linewidth=0.5)
+
+    try:
+        kde_true = gaussian_kde(true_values)
+        x_range = np.linspace(plot_min, plot_max, 200)
+        ax_top.plot(x_range, kde_true(x_range), 'b-', linewidth=2, label='True values density')
+    except:
+        pass
+
+    ax_top.set_xlim(plot_min, plot_max)
+    ax_top.set_ylabel('')
+    ax_top.tick_params(axis='x', labelbottom=False)
+    ax_top.set_yticks([])
+
+    ax_right.hist(pred_values, bins=bins, density=True, alpha=0.7,
+                 color='lightblue', edgecolor='black', linewidth=0.5,
+                 orientation='horizontal')
+
+    try:
+        kde_pred = gaussian_kde(pred_values)
+        y_range = np.linspace(plot_min, plot_max, 200)
+        ax_right.plot(kde_pred(y_range), y_range, 'b-', linewidth=2, label='Predicted values density')
+    except:
+        pass
+
+    ax_right.set_ylim(plot_min, plot_max)
+    ax_right.set_xlabel('')
+    ax_right.tick_params(axis='y', labelleft=False)
+    ax_right.set_xticks([])
+
+    for ax in (ax_top, ax_right):
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    title = f'LAT Parity Plot - {dataset_name}'
+    if experiment_name:
+        title += f'\n{experiment_name}'
+    fig.suptitle(title, fontsize=16, y=0.95)
+
+    plot_filename = f'parity_plot_{dataset_name.lower()}_with_density.png'
+    plt.savefig(os.path.join(save_path, plot_filename), dpi=300, bbox_inches='tight')
     plt.close()
 
-    summary = {
-        "total_residues": int(len(residue_df)),
-        "total_variants": int(len(sequence_df)),
-        "mean_attention_score": float(residue_df["attention_score"].mean()),
-        "std_attention_score": float(residue_df["attention_score"].std()),
-        "attention_mode": attention_mode,
-        "top_residues_by_mean_attention": by_residue.head(5)[
-            ["residue", "mean"]
-        ].to_dict("records"),
+    print(f"Parity plot saved to: {os.path.join(save_path, plot_filename)}")
+
+    return {'mse': float(mse), 'mae': float(mae), 'r2': float(r2)}
+
+
+def build_dataloaders(args):
+    """Create train/val/test dataloaders with basic checks"""
+    missing = [p for p in [args.train_csv, args.val_csv, args.test_csv, args.fasta_path]
+               if not os.path.exists(p)]
+    if missing:
+        print("\n[ERROR] The following files were not found:")
+        for m in missing:
+            print("   -", m)
+        print("Fix the paths (flags: --train_csv/--val_csv/--test_csv/--fasta_path) and re-run.")
+        sys.exit(1)
+
+    datasets = {
+        'train': ProteinDataset(args.train_csv, args.fasta_path, args.target_column, args.sequence_column),
+        'val':   ProteinDataset(args.val_csv,   args.fasta_path, args.target_column, args.sequence_column),
+        'test':  ProteinDataset(args.test_csv,  args.fasta_path, args.target_column, args.sequence_column),
     }
-    with open(os.path.join(save_dir, "attention_summary.json"), "w") as handle:
-        json.dump(summary, handle, indent=2)
-    print(f"Attention analysis saved to: {save_dir}")
-    return summary
+
+    loaders = {
+        name: DataLoader(ds, batch_size=args.batch_size, shuffle=(name == 'train'),
+                         collate_fn=collate_fn, num_workers=2, pin_memory=True, drop_last=True)
+        for name, ds in datasets.items()
+    }
+    return loaders['train'], loaders['val'], loaders['test']
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def run_attention_analysis(model, dataset, args):
+    """Extract attention scores and write all analysis artifacts"""
+    attn_dir = os.path.join(args.save_dir, args.attention_output_dir)
+    os.makedirs(attn_dir, exist_ok=True)
+
+    extractor = AttentionExtractor(model, model.device, attention_mode=args.attention_mode)
+    attn_df, seq_df = extractor.extract_from_dataset(dataset, batch_size=args.batch_size)
+
+    attn_df.to_csv(os.path.join(attn_dir, "attention_per_residue.csv"), index=False)
+    seq_df.to_csv(os.path.join(attn_dir, "attention_per_sequence.csv"), index=False)
+    extractor.analyze_attention_patterns(attn_df, seq_df, attn_dir)
+
+    print(f"[INFO] Attention artifacts saved under: {attn_dir}")
+
 
 def main():
     args = parse_arguments()
-    common.set_seed(args.seed)
-    device = common.get_device()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    experiment_name = "LightAAV"
-    if args.finetune_esm:
-        experiment_name += f" + LoRA (r={args.lora_rank}, alpha={args.lora_alpha})"
+    print("\n================ LAT Runner ================")
+    print(f"Mode                 : {args.mode}")
+    print(f"ESM model            : {ESM2_MODEL_NAME}")
+    print(f"Finetune ESM         : {args.finetune_esm}")
+    print(f"Unfreeze top         : {args.unfreeze_top}")
+    print(f"ESM lr / Top lr      : {args.esm_lr} / {args.lr}")
+    print(f"Batch size           : {args.batch_size}")
+    print(f"Epochs (min/max)     : {args.min_epoch} / {args.max_epoch}")
+    print(f"Extract attention    : {args.extract_attention}")
+    print(f"Save dir             : {args.save_dir}")
+    print("==================================================\n")
 
-    print("=" * 60)
-    print("LightAAV")
-    print("=" * 60)
-    print(f"Target        : {args.target_column}")
-    print(f"ESM encoder   : {ESM_MODEL}")
-    print(f"Fine-tune ESM : {args.finetune_esm}")
-    if args.finetune_esm:
-        print(f"  LoRA r/alpha: {args.lora_rank} / {args.lora_alpha}")
-        print(f"  LoRA targets: {args.lora_target_modules}")
-        print(f"  LoRA layers : {args.lora_target_layers or 'all'}")
-        print(f"  ESM LR      : {args.esm_lr}")
-    print(f"Batch / LR    : {args.batch_size} / {args.lr}")
-    print(f"Epochs        : {args.min_epoch}-{args.max_epoch}")
-    print(f"Device        : {device}")
-    print(f"Save dir      : {args.save_dir}")
-    print("=" * 60)
+    # Build dataloaders (also validates paths)
+    train_loader, val_loader, test_loader = build_dataloaders(args)
 
-    train_loader, val_loader, test_loader = common.build_dataloaders(
-        args, drop_last_train=True
+    training_mode = (args.mode == "train")
+    model = LATModel(
+        seed=42,
+        training_mode=training_mode,
+        finetune_esm=args.finetune_esm,
+        args=args
     )
-    loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+    print(f"Device: {model.device}")
 
-    model = LightAAVModel(args, device)
-    history, checkpoint_path = train_model(model, train_loader, val_loader, args)
+    criterion = nn.MSELoss()
 
-    checkpoint = model.load(checkpoint_path)
-    print(f"\nLoaded best model from epoch {checkpoint['epoch']}")
+    if args.mode == "train":
+        optimizer = get_optimizer(model, args)
 
-    common.save_training_history(history, args.save_dir)
-    common.plot_training_curves(history, args.save_dir,
-                                experiment_name=experiment_name)
+        best_val_loss = float("inf")
+        patience_left = args.patience
 
-    all_metrics = {"best_epoch": checkpoint["epoch"]}
-    test_preds = test_targets = None
-    for split_name, loader in loaders.items():
-        preds, targets, embeddings, accs, seqs = collect_predictions(model, loader)
-        all_metrics[split_name] = common.regression_metrics(targets, preds)
-        if split_name == "test":
-            test_preds, test_targets = preds, targets
-            common.save_predictions_csv(
-                accs, seqs, targets, preds, args.save_dir,
-                embeddings=embeddings if args.save_embeddings else None,
+        print("[INFO] Starting training loop...")
+        for epoch in range(1, args.max_epoch + 1):
+            warmup_phase = args.finetune_esm and (epoch <= args.warmup_epochs)
+            tr_loss, tr_r2, _, _, _, _ = model.train_epoch(
+                train_loader, optimizer, criterion, warmup_phase=warmup_phase
             )
+            va_loss, va_r2, _, _, _, _ = model.validate_epoch(val_loader, criterion)
 
-    common.plot_parity(test_targets, test_preds, args.save_dir,
-                       dataset_name="Test", experiment_name=experiment_name)
-    common.save_metrics_json(all_metrics, args.save_dir)
+            print(f"[Epoch {epoch:03d}] "
+                  f"Train: loss {tr_loss:.4f}, R2 {tr_r2:.4f} | "
+                  f"Val: loss {va_loss:.4f}, R2 {va_r2:.4f}")
 
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    for split_name in loaders:
-        print(common.format_metrics(split_name, all_metrics[split_name]))
-    print("=" * 60)
+            # Save best after min_epoch
+            if epoch >= args.min_epoch and va_loss < best_val_loss - 1e-9:
+                best_val_loss = va_loss
+                patience_left = args.patience
+                ckpt_path = os.path.join(args.save_dir, "best.pt")
+                model.save_model(ckpt_path, epoch, optimizer,
+                                 train_loss=tr_loss, val_loss=va_loss,
+                                 train_r2=tr_r2, val_r2=va_r2)
+                print(f"[INFO] New best model saved to {ckpt_path} (val_loss={va_loss:.4f})")
+            elif epoch >= args.min_epoch:
+                patience_left -= 1
+                if patience_left <= 0:
+                    print(f"[EARLY STOP] No improvement for {args.patience} epochs after min_epoch. "
+                          f"Best val_loss={best_val_loss:.4f}")
+                    break
 
-    if args.extract_attention:
-        attention_dir = os.path.join(args.save_dir, "attention_analysis")
-        residue_df, sequence_df = extract_attention_table(
-            model, test_loader, attention_dir, args.attention_mode
-        )
-        analyze_attention(residue_df, sequence_df, attention_dir,
-                          args.attention_mode)
+        if args.extract_attention:
+            print("\n[INFO] Extracting attention...")
+            run_attention_analysis(model, val_loader.dataset, args)
 
-    print(f"\nDone. Results written to {args.save_dir}")
+        # Final test evaluation (using best weights if saved)
+        print("\n[INFO] Running final evaluation on test set...")
+        try:
+            best_ckpt = os.path.join(args.save_dir, "best.pt")
+            if os.path.exists(best_ckpt):
+                model.load_model(best_ckpt)
+            te_loss, te_r2, te_mae, te_mse, te_pred, te_tgt = model.validate_epoch(test_loader, criterion)
+            print(f"[TEST] loss {te_loss:.4f} | R2 {te_r2:.4f} | MAE {te_mae:.4f} | RMSE {np.sqrt(te_mse):.4f}")
+            try:
+                plot_parity_plot(te_tgt, te_pred, "Test", args.save_dir, experiment_name="LAT")
+            except Exception as e:
+                print("[WARN] Failed to create parity plot:", e)
+        except Exception as e:
+            print("[WARN] Test evaluation failed:", e)
+
+    else:
+        # predict / extract_attention both need trained weights
+        if not args.model_path or not os.path.exists(args.model_path):
+            print("[ERROR] --model_path pointing to a trained checkpoint is required "
+                  f"for mode '{args.mode}'.")
+            sys.exit(1)
+        model.load_model(args.model_path)
+
+        if args.mode == "extract_attention":
+            run_attention_analysis(model, test_loader.dataset, args)
+        else:
+            te_loss, te_r2, te_mae, te_mse, te_pred, te_tgt = model.validate_epoch(test_loader, criterion)
+            print(f"[TEST] loss {te_loss:.4f} | R2 {te_r2:.4f} | MAE {te_mae:.4f} | RMSE {np.sqrt(te_mse):.4f}")
+            pd.DataFrame({'true_value': te_tgt, 'predicted_value': te_pred}).to_csv(
+                os.path.join(args.save_dir, 'prediction.csv'), index=False)
+            print(f"[INFO] Predictions saved to {os.path.join(args.save_dir, 'prediction.csv')}")
 
 
 if __name__ == "__main__":
