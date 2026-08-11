@@ -55,7 +55,7 @@ except ImportError as exc:  # pragma: no cover - depends on user environment
     ) from exc
 
 # LightAAV is defined on ESM2; its per-residue width and final layer index.
-ESM_MODEL = "esm1v_t33_650M_UR90S_1"
+ESM_MODEL = "esm2_t12_35M_UR50D"
 ESM_EMBED_DIM = 1280
 ESM_REPR_LAYER = 33
 
