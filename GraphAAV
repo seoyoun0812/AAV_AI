@@ -89,7 +89,7 @@ def parse_arguments():
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--esm_model", type=str, default="esm1v_t33_650M_UR90S_1",
+    parser.add_argument("--esm_model", type=str, default="esm2_t12_35M_UR50D",
                         choices=sorted(ESM_MODELS))
 
     # Outputs
@@ -307,7 +307,7 @@ class ESMFeatureExtractor:
 
 class GraphAAV(nn.Module):
     def __init__(self, hidden_dim, num_layers, dropout, device, num_heads=4,
-                 esm_model="esm1v_t33_650M_UR90S_1"):
+                 esm_model="esm2_t12_35M_UR50D"):
         super().__init__()
         self.device = device
         self.hidden_dim = hidden_dim
