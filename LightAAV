@@ -1,8 +1,8 @@
-"""LightAAV: residual light attention regression on ESM1v per-residue embeddings.
+"""LightAAV: residual light attention regression on ESM2 per-residue embeddings.
 
-Per-residue ESM1v embeddings are fed to a residual light-attention head
+Per-residue ESM2 embeddings are fed to a residual light-attention head
 (Gado et al., 2025) that applies local attention over the sequence and pools it
-into a variant-level prediction. The ESM1v encoder can optionally be adapted
+into a variant-level prediction. The ESM2 encoder can optionally be adapted
 with LoRA adapters on selected transformer layers.
 
 Usage:
@@ -54,12 +54,12 @@ except ImportError as exc:  # pragma: no cover - depends on user environment
         "it to PYTHONPATH (see README, 'External dependencies')."
     ) from exc
 
-# LightAAV is defined on ESM1v; its per-residue width and final layer index.
+# LightAAV is defined on ESM2; its per-residue width and final layer index.
 ESM_MODEL = "esm1v_t33_650M_UR90S_1"
 ESM_EMBED_DIM = 1280
 ESM_REPR_LAYER = 33
 
-# Friendly LoRA target names mapped onto ESM1v submodule names.
+# Friendly LoRA target names mapped onto ESM2 submodule names.
 LORA_MODULE_ALIASES = {
     "query": "q_proj",
     "key": "k_proj",
@@ -112,9 +112,9 @@ def parse_arguments():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--activation", type=str, default="elu")
 
-    # LoRA fine-tuning of the ESM1v encoder
+    # LoRA fine-tuning of the ESM2 encoder
     parser.add_argument("--finetune_esm", action="store_true",
-                        help="Adapt the ESM1v encoder with LoRA adapters")
+                        help="Adapt the ESM2 encoder with LoRA adapters")
     parser.add_argument("--esm_lr", type=float, default=1e-5)
     parser.add_argument("--esm_weight_decay", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -182,7 +182,7 @@ def resolve_lora_targets(module_names, target_layers):
 # ---------------------------------------------------------------------------
 
 class LightAAVModel:
-    """ESM1v encoder (optionally LoRA-adapted) plus a light-attention head.
+    """ESM2 encoder (optionally LoRA-adapted) plus a light-attention head.
 
     This is a plain container rather than an ``nn.Module`` because the encoder
     and the head are optimised with separate parameter groups and learning
@@ -231,7 +231,7 @@ class LightAAVModel:
         target_modules = resolve_lora_targets(
             self.args.lora_target_modules, target_layers
         )
-        print("Setting up LoRA on the ESM1v encoder")
+        print("Setting up LoRA on the ESM2 encoder")
         print(f"  layers  : {target_layers if target_layers else 'all'}")
         print(f"  modules : {target_modules[:5]}"
               f"{'...' if len(target_modules) > 5 else ''} "
@@ -276,7 +276,7 @@ class LightAAVModel:
         if trainable == 0:
             raise RuntimeError(
                 "No trainable LoRA parameters were injected. Check "
-                "--lora_target_modules against the ESM1v module names."
+                "--lora_target_modules against the ESM2 module names."
             )
         print(f"  trainable: {trainable:,} / {total:,} "
               f"({100 * trainable / total:.2f}%)")
@@ -301,7 +301,7 @@ class LightAAVModel:
     # -- forward ------------------------------------------------------------
 
     def embed(self, accs, seqs):
-        """Per-residue ESM1v embeddings as ``[batch, features, max_len]``.
+        """Per-residue ESM2 embeddings as ``[batch, features, max_len]``.
 
         BOS/EOS tokens are stripped so that position 0 is the first residue,
         which is what the mask built in :meth:`forward` assumes.
