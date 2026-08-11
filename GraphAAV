@@ -1,215 +1,228 @@
-"""GraphAAV: graph-transformer regression on ESM per-residue embeddings.
-
-Each capsid variant is turned into a sequence-local graph: nodes are residues
-carrying per-residue protein-language-model embeddings, and edges connect
-residues within a +/-3 position window with a 5-dimensional relative-position
-feature. A TransformerConv encoder with edge updates and context gating
-produces node states, which are pooled by global attention and mapped to a
-scalar (tissue enrichment or production fitness) by an MLP head.
-
-Usage:
-    python src/graphaav.py --mode train --target_column production_fitness
-    python src/graphaav.py --mode all --compare_representations
-"""
-
-import argparse
-import os
-import sys
-import warnings
-
-import esm
-import matplotlib.pyplot as plt
+# -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import random
+import tqdm
+import argparse
+import os
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from scipy.stats import gaussian_kde
+
+from torch_scatter import scatter_mean
+from torch_geometric.nn import TransformerConv, GlobalAttention
 import torch_geometric
 import torch_geometric.data
-import tqdm
+import logging
 from sklearn.decomposition import PCA
-from torch_geometric.nn import GlobalAttention, TransformerConv
-from torch_scatter import scatter_mean
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import common  # noqa: E402
+warnings.filterwarnings('ignore')
+import esm
 
-warnings.filterwarnings("ignore")
+plt.style.use('default')
+sns.set_palette("husl")
 
-# Per-residue embedding size and final representation layer of each supported
-# encoder. Keeping the loader name, the width and the layer index in one place
-# avoids the three-way mismatch that arises when they are hard-coded separately.
-ESM_MODELS = {
-    "esm1v_t33_650M_UR90S_1": {"embed_dim": 1280, "repr_layer": 33},
-    "esm2_t12_35M_UR50D": {"embed_dim": 480, "repr_layer": 12},
-    "esm2_t30_150M_UR50D": {"embed_dim": 640, "repr_layer": 30},
-}
-
-# Residues are connected to neighbours within this window (manuscript Eq. 4).
-EDGE_WINDOW = 3
-EDGE_FEATURE_DIM = 5
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+logger.addHandler(handler)
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Train GraphAAV for AAV capsid property prediction"
-    )
-
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "all"],
-                        help="'train' trains and evaluates; 'all' additionally "
-                             "extracts ESM/GNN representations before and after training")
-
-    # Data
-    parser.add_argument("--train_csv", type=str, default="data/train.csv")
-    parser.add_argument("--val_csv", type=str, default="data/valid.csv")
-    parser.add_argument("--test_csv", type=str, default="data/test.csv")
-    parser.add_argument("--fasta_path", type=str, default="data/sequences.fasta",
-                        help="FASTA of full-length capsid sequences")
-    parser.add_argument("--target_column", type=str, default="production_fitness",
-                        help="Regression target column in the CSV files")
-    parser.add_argument("--sequence_column", type=str, default="full_sequence")
-
-    # Optimisation
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--min_epoch", type=int, default=80,
-                        help="Early stopping is only considered after this epoch")
-    parser.add_argument("--max_epoch", type=int, default=400)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--weight_decay", type=float, default=5e-5)
-    parser.add_argument("--patience", type=int, default=15,
-                        help="Early stopping patience")
-    parser.add_argument("--lr_factor", type=float, default=0.7,
-                        help="ReduceLROnPlateau decay factor")
-    parser.add_argument("--lr_patience", type=int, default=10,
-                        help="ReduceLROnPlateau patience")
-    parser.add_argument("--seed", type=int, default=42)
-
-    # Architecture
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--esm_model", type=str, default="esm2_t12_35M_UR50D",
-                        choices=sorted(ESM_MODELS))
-
-    # Outputs
-    parser.add_argument("--save_dir", type=str, default="results/graphaav")
-    parser.add_argument("--extract_attention", action="store_true",
-                        help="Write per-residue attention scores for the test set")
-    parser.add_argument("--compare_representations", action="store_true",
-                        help="Plot PCA / performance comparison of representations "
-                             "(requires --mode all)")
-
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Train ESM-GNN model for enzyme property prediction")
+    
+    # Mode selection
+    parser.add_argument('--mode', type=str, default='train', 
+                        choices=['train', 'predict', 'extract_esm', 'extract_representations', 'all'],
+                        help='Mode: train, predict, extract_esm, extract_representations, or all (train + extract)')
+    
+    # Add flag for automatic extraction after training
+    parser.add_argument('--auto_extract', action='store_true',
+                        help='Automatically extract representations after training')
+    
+    # Data paths
+    parser.add_argument('--train_csv', type=str, 
+                        default='/workspace/topten_full/top3_full_train.csv',
+                        help='Path to training CSV file')
+    parser.add_argument('--val_csv', type=str,
+                        default='/workspace/topten_full/top3_full_valid.csv', 
+                        help='Path to validation CSV file')
+    parser.add_argument('--test_csv', type=str,
+                        default='/workspace/topten_full/top3_full_test.csv',
+                        help='Path to test CSV file')
+    parser.add_argument('--target_column', type=str, default='production_fitness',
+                        help='Target column name in CSV')
+    parser.add_argument('--sequence_column', type=str, default='full_sequence',
+                        help='Sequence column name in CSV')
+    
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size for training')
+    parser.add_argument('--min_epoch', type=int, default=80,
+                        help='Minimum number of epochs to train')
+    parser.add_argument('--max_epoch', type=int, default=400,
+                        help='Maximum number of epochs to train')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=5e-5,
+                        help='Weight decay')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience')
+    
+    # File paths
+    parser.add_argument('--fasta_path', type=str, 
+                        default='/workspace/EpHod/ephod/26000_sequences.fasta',
+                        help='Path to fasta file of enzyme sequences')
+    parser.add_argument('--save_dir', type=str, default='./fffinalesmt12gnnproductionfitness',
+                        help='Directory to which results will be written')
+    parser.add_argument('--verbose', default=1, type=int,
+                        help='Whether to print out progress to terminal')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to saved model for prediction mode')
+    
+    # Model architecture
+    parser.add_argument('--hidden_dim', type=int, default=256,
+                        help='Hidden dimension for GNN')
+    parser.add_argument('--num_layers', type=int, default=4,
+                        help='Number of GNN layers')
+    parser.add_argument('--dropout', type=float, default=0.0,
+                        help='Dropout rate')
+    parser.add_argument('--num_heads', type=int, default=4,
+                        help='Number of attention heads')
+    
+    # ESM extraction arguments
+    parser.add_argument('--extract_csv', type=str, 
+                        default='/workspace/final_enrichment_data_top3tenexclude_full.csv',
+                        help='Path to CSV file for ESM embedding extraction')
+    parser.add_argument('--extract_batch_size', type=int, default=16,
+                        help='Batch size for ESM embedding extraction')
+    parser.add_argument('--esm_output', type=str, default='esm_embeddings_combined.csv',
+                        help='Output file for ESM embeddings')
+    parser.add_argument('--save_embeddings', action='store_true',
+                        help='Save ESM embeddings during training')
+    
+    # ESM model configuration
+    parser.add_argument('--esm_model', type=str, default='facebook/esm2_t12_35M_UR50D',
+                        choices=['facebook/esm1v_t33_650M_UR50D', 'facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D'],
+                        help='ESM model to use for feature extraction')
+    parser.add_argument('--use_finetuned', action='store_true',
+                        help='Use fine-tuned ESM model')
+    parser.add_argument('--finetuned_checkpoint', type=str, default=None,
+                        help='Path to fine-tuned ESM model checkpoint')
+    
+    # Combined dataset for extraction
+    parser.add_argument('--combine_datasets', action='store_true',
+                        help='Combine train/val/test datasets for embedding extraction')
+    
+    # Representation comparison
+    parser.add_argument('--compare_representations', action='store_true',
+                        help='Compare extracted representations with visualizations')
+    
     args = parser.parse_args()
+    
     if args.min_epoch > args.max_epoch:
-        raise ValueError(
-            f"min_epoch ({args.min_epoch}) cannot exceed max_epoch ({args.max_epoch})"
-        )
-    if args.hidden_dim % args.num_heads != 0:
-        raise ValueError("hidden_dim must be divisible by num_heads")
+        raise ValueError(f"min_epoch ({args.min_epoch}) cannot be greater than max_epoch ({args.max_epoch})")
+    
     return args
 
 
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
+# ===============================
+# UTILITY FUNCTIONS
+# ===============================
 
-def create_graph_from_sequence(sequence, node_embeddings, device):
-    """Build the sequence-local graph for one variant.
+def read_fasta(fasta, return_as_dict=False):
+    headers, sequences = [], []
+    with open(fasta, 'r') as fast:
+        for line in fast:
+            if line.startswith('>'):
+                head = line.replace('>','').strip()
+                headers.append(head)
+                sequences.append('')
+            else :
+                seq = line.strip()
+                if len(seq) > 0:
+                    sequences[-1] += seq
+    if return_as_dict:
+        return dict(zip(headers, sequences))
+    else:
+        return (headers, sequences) 
 
+
+def replace_noncanonical(seq, replace_char='X'):
+    """Replace all non-canonical amino acids with a specific character"""
+    for char in ['B', 'J', 'O', 'U', 'Z']:
+        seq = seq.replace(char, replace_char)
+    return seq
+
+
+def create_graph_from_sequence(sequence, esm_node_emb, device):
+    """Create graph from sequence with per-residue ESM embeddings and sequence-based edge features
+    
     Args:
-        sequence: capsid sequence (length L).
-        node_embeddings: per-residue embeddings, shape ``[L, d]``.
-        device: device on which to allocate the graph tensors.
-
+        sequence: protein sequence string
+        esm_node_emb: per-residue ESM embeddings [L, d_ESM]
+        device: torch device
+    
     Returns:
-        ``Data`` with ``x=[L, d]``, ``edge_index`` and ``edge_attr=[E, 5]``,
-        where each edge feature is
-        ``[|i-j|/3, sign(j-i), 1{|i-j|=1}, 1{|i-j|=2}, 1{|i-j|=3}]``.
+        Data object with x=[L, d_ESM], edge_index, edge_attr=[num_edges, 5]
     """
-    length = len(sequence)
+    L = len(sequence)
     src, dst, edge_feat = [], [], []
-
-    for i in range(length):
-        for j in range(max(0, i - EDGE_WINDOW), min(length, i + EDGE_WINDOW + 1)):
+    
+    # Create edges connecting residues within 3 window with relative position features
+    for i in range(L):
+        for j in range(max(0, i-3), min(L, i+4)):
             if i == j:
                 continue
             src.append(i)
             dst.append(j)
-            offset = abs(i - j)
+            
+            rel = abs(i - j)
             edge_feat.append([
-                offset / EDGE_WINDOW,
-                1.0 if j > i else -1.0,
-                float(offset == 1),
-                float(offset == 2),
-                float(offset == 3),
+                float(rel) / 3.0,            # Normalized distance (|i-j| / 3)  [0, 1]
+                1.0 if j > i else -1.0,      # Direction: sign(j-i)
+                1.0 if rel == 1 else 0.0,    # 1-hop neighbor
+                1.0 if rel == 2 else 0.0,    # 2-hop neighbor
+                1.0 if rel == 3 else 0.0     # 3-hop neighbor
             ])
-
-    return torch_geometric.data.Data(
-        x=node_embeddings.to(device),
-        edge_index=torch.tensor([src, dst], device=device, dtype=torch.long),
-        edge_attr=torch.tensor(edge_feat, device=device, dtype=torch.float),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Encoder blocks
-# ---------------------------------------------------------------------------
-
-class EdgeMLP(nn.Module):
-    """Update each edge from its two endpoint node states."""
-
-    def __init__(self, num_hidden, dropout=0.0):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.BatchNorm1d(num_hidden)
-        self.W11 = nn.Linear(3 * num_hidden, num_hidden, bias=True)
-        self.W12 = nn.Linear(num_hidden, num_hidden, bias=True)
-        self.act = nn.GELU()
-
-    def forward(self, h_V, edge_index, h_E):
-        src_idx, dst_idx = edge_index[0], edge_index[1]
-        h_EV = torch.cat([h_V[src_idx], h_E, h_V[dst_idx]], dim=-1)
-        h_message = self.W12(self.act(self.W11(h_EV)))
-        return self.norm(h_E + self.dropout(h_message))
+    
+    edge_index = torch.tensor([src, dst], device=device, dtype=torch.long)
+    edge_attr = torch.tensor(edge_feat, device=device, dtype=torch.float)
+    x = esm_node_emb.to(device)  # [L, d_ESM]
+    
+    return torch_geometric.data.Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-class Context(nn.Module):
-    """Gate node states by a graph-level context vector."""
-
-    def __init__(self, num_hidden):
-        super().__init__()
-        self.V_MLP_g = nn.Sequential(
-            nn.Linear(num_hidden, num_hidden),
-            nn.ReLU(),
-            nn.Linear(num_hidden, num_hidden),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, h_V, batch_id):
-        c_V = scatter_mean(h_V, batch_id, dim=0)
-        return h_V * self.V_MLP_g(c_V[batch_id])
-
+# ===============================
+# MODEL COMPONENTS
+# ===============================
 
 class GNNLayer(nn.Module):
-    """Edge-conditioned multi-head message passing with an edge update."""
-
     def __init__(self, num_hidden, dropout=0.0, num_heads=4):
-        super().__init__()
+        super(GNNLayer, self).__init__()
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.ModuleList([nn.BatchNorm1d(num_hidden) for _ in range(2)])
+
         self.attention = TransformerConv(
-            in_channels=num_hidden,
-            out_channels=num_hidden // num_heads,
-            heads=num_heads,
-            dropout=dropout,
-            edge_dim=num_hidden,
-            root_weight=False,
+            in_channels=num_hidden, 
+            out_channels=int(num_hidden / num_heads), 
+            heads=num_heads, 
+            dropout=dropout, 
+            edge_dim=num_hidden, 
+            root_weight=False
         )
         self.PositionWiseFeedForward = nn.Sequential(
-            nn.Linear(num_hidden, num_hidden * 4),
+            nn.Linear(num_hidden, num_hidden*4),
             nn.ReLU(),
-            nn.Linear(num_hidden * 4, num_hidden),
+            nn.Linear(num_hidden*4, num_hidden)
         )
         self.edge_update = EdgeMLP(num_hidden, dropout)
         self.context = Context(num_hidden)
@@ -223,588 +236,1246 @@ class GNNLayer(nn.Module):
 
         h_E = self.edge_update(h_V, edge_index, h_E)
         h_V = self.context(h_V, batch_id)
+
         return h_V, h_E
 
 
-class GraphEncoder(nn.Module):
-    """Input embeddings followed by a stack of :class:`GNNLayer` blocks."""
+class EdgeMLP(nn.Module):
+    def __init__(self, num_hidden, dropout=0.0):
+        super(EdgeMLP, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.BatchNorm1d(num_hidden)
+        self.W11 = nn.Linear(3*num_hidden, num_hidden, bias=True)
+        self.W12 = nn.Linear(num_hidden, num_hidden, bias=True)
+        self.act = torch.nn.GELU()
 
+    def forward(self, h_V, edge_index, h_E):
+        src_idx = edge_index[0]
+        dst_idx = edge_index[1]
+
+        h_EV = torch.cat([h_V[src_idx], h_E, h_V[dst_idx]], dim=-1)
+        h_message = self.W12(self.act(self.W11(h_EV)))
+        h_E = self.norm(h_E + self.dropout(h_message))
+        return h_E
+
+
+class Context(nn.Module):
+    def __init__(self, num_hidden):
+        super(Context, self).__init__()
+        self.V_MLP_g = nn.Sequential(
+            nn.Linear(num_hidden, num_hidden),
+            nn.ReLU(),
+            nn.Linear(num_hidden, num_hidden),
+            nn.Sigmoid()
+        )
+
+    def forward(self, h_V, batch_id):
+        c_V = scatter_mean(h_V, batch_id, dim=0)
+        h_V = h_V * self.V_MLP_g(c_V[batch_id])
+        return h_V
+
+
+class Graph_encoder(nn.Module):
     def __init__(self, node_in_dim, edge_in_dim, hidden_dim,
-                 num_layers=4, drop_rate=0.0, num_heads=4):
-        super().__init__()
+                 num_layers=4, drop_rate=0.2, num_heads=4):
+        super(Graph_encoder, self).__init__()
+        
         self.node_embedding = nn.Linear(node_in_dim, hidden_dim, bias=True)
         self.edge_embedding = nn.Linear(edge_in_dim, hidden_dim, bias=True)
         self.norm_nodes = nn.BatchNorm1d(hidden_dim)
         self.norm_edges = nn.BatchNorm1d(hidden_dim)
+        
         self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.W_e = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        
         self.layers = nn.ModuleList([
             GNNLayer(num_hidden=hidden_dim, dropout=drop_rate, num_heads=num_heads)
             for _ in range(num_layers)
         ])
 
-    def embed_inputs(self, h_V, h_E):
+    def forward(self, h_V, edge_index, h_E, batch_id):
+        device = h_V.device
+        edge_index = edge_index.to(device)
+        h_E = h_E.to(device)
+        batch_id = batch_id.to(device)
+        
         h_V = self.W_v(self.norm_nodes(self.node_embedding(h_V)))
         h_E = self.W_e(self.norm_edges(self.edge_embedding(h_E)))
-        return h_V, h_E
 
-    def forward(self, h_V, edge_index, h_E, batch_id):
-        h_V, h_E = self.embed_inputs(h_V, h_E)
         for layer in self.layers:
             h_V, h_E = layer(h_V, edge_index, h_E, batch_id)
+        
         return h_V
 
 
-# ---------------------------------------------------------------------------
-# ESM feature extraction
-# ---------------------------------------------------------------------------
-
 class ESMFeatureExtractor:
-    """Frozen protein language model producing per-residue embeddings.
-
-    The encoder is deliberately held outside ``nn.Module`` registration so its
-    weights are neither optimised nor written into GraphAAV checkpoints.
-    """
-
-    def __init__(self, model_name, device):
-        if model_name not in ESM_MODELS:
-            raise ValueError(
-                f"Unknown ESM model '{model_name}'. "
-                f"Available: {sorted(ESM_MODELS)}"
-            )
+    """Enhanced ESM feature extractor with support for different models"""
+    
+    def __init__(self, model_name='esm2_t12_35M_UR50D', device='cuda', use_finetuned=False, checkpoint_path=None):
         self.device = device
         self.model_name = model_name
-        self.embed_dim = ESM_MODELS[model_name]["embed_dim"]
-        self.repr_layer = ESM_MODELS[model_name]["repr_layer"]
-
-        self.model, self.alphabet = getattr(esm.pretrained, model_name)()
-        self.batch_converter = self.alphabet.get_batch_converter()
+        self.use_finetuned = use_finetuned
+        
+        if use_finetuned and checkpoint_path:
+            self.model = self.load_finetuned_model(checkpoint_path)
+        else:
+            self.model, self.alphabet = self._load_pretrained_model(model_name)
+            self.batch_converter = self.alphabet.get_batch_converter()
+        
         self.model = self.model.to(device).eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        print(f"Loaded {model_name} (frozen, {self.embed_dim}-dim, "
-              f"layer {self.repr_layer})")
-
-    def extract(self, accs, seqs):
-        """Return a list of ``[L, d]`` tensors, one per sequence."""
-        seqs = [common.replace_noncanonical(seq) for seq in seqs]
-        data = list(zip(accs, seqs))
-
+        print(f"Loaded ESM model: {model_name} {'(fine-tuned)' if use_finetuned else '(pretrained)'}")
+    
+    def _load_pretrained_model(self, model_name):
+        """Load pretrained ESM model"""
+        if model_name == 'facebook/esm1v_t33_650M_UR50D':
+            return esm.pretrained.esm1v_t33_650M_UR90S_1()
+        elif model_name == 'facebook/esm2_t12_35M_UR50D':
+            return esm.pretrained.esm2_t12_35M_UR50D()
+        elif model_name == 'esm2_t30_150M_UR50D':
+            return esm.pretrained.esm2_t30_150M_UR50D()
+        else:
+            raise ValueError(f"Unknown ESM model: {model_name}")
+    
+    def load_finetuned_model(self, checkpoint_path):
+        """Load fine-tuned ESM model"""
+        print(f"Loading fine-tuned model from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model, alphabet = self._load_pretrained_model(self.model_name)
+        return model
+    
+    def extract_features(self, sequences, protein_ids, layer_idx=None):
+        """Extract per-residue ESM features for a list of sequences"""
+        sequences = [replace_noncanonical(seq, 'X') for seq in sequences]
+        data = [(protein_ids[i], sequences[i]) for i in range(len(sequences))]
+        
+        if layer_idx is None:
+            layer_idx = self.model.num_layers
+        
         with torch.no_grad():
-            _, _, tokens = self.batch_converter(data)
-            tokens = tokens.to(self.device, non_blocking=True)
-            out = self.model(tokens, repr_layers=[self.repr_layer],
-                             return_contacts=False)
-            reps = out["representations"][self.repr_layer]
-            # Index 0 is the BOS token, so residue i sits at position i+1.
-            return [reps[i, 1:len(seq) + 1] for i, seq in enumerate(seqs)]
+            batch_labels, batch_strs, batch_tokens = self.batch_converter(data)
+            batch_tokens = batch_tokens.to(device=self.device, non_blocking=True)
+            
+            results = self.model(batch_tokens, repr_layers=[layer_idx], 
+                               return_contacts=False)
+            embeddings = results["representations"][layer_idx]
+            
+            sequence_embeddings = []
+            for i, seq in enumerate(sequences):
+                seq_len = len(seq)
+                # Return per-residue embeddings [L, d_ESM] instead of averaging
+                seq_repr = embeddings[i, 1:seq_len+1]  # [L, d_ESM]
+                sequence_embeddings.append(seq_repr.cpu())
+        
+        return sequence_embeddings
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-class GraphAAV(nn.Module):
-    def __init__(self, hidden_dim, num_layers, dropout, device, num_heads=4,
-                 esm_model="esm2_t12_35M_UR50D"):
-        super().__init__()
+class ESM_GNN_Model(nn.Module): 
+    def __init__(self, hidden_dim, num_layers, dropout, device, num_heads=4, 
+                 esm_model='esm2_t12_35M_UR50D', use_finetuned=False, checkpoint_path=None):
+        super(ESM_GNN_Model, self).__init__()
         self.device = device
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-
-        self.esm_extractor = ESMFeatureExtractor(esm_model, device)
-
-        # Attribute names below are part of the checkpoint keys; renaming them
-        # would invalidate previously trained best_model.pt files.
-        self.Graph_encoder = GraphEncoder(
-            node_in_dim=self.esm_extractor.embed_dim,
-            edge_in_dim=EDGE_FEATURE_DIM,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            drop_rate=dropout,
-            num_heads=num_heads,
+        
+        self.esm_extractor = ESMFeatureExtractor(
+            model_name=esm_model, 
+            device=device, 
+            use_finetuned=use_finetuned,
+            checkpoint_path=checkpoint_path
         )
+        
+        if 'esm1v' in esm_model:
+            esm_dim = 1280
+        elif 'esm2_t12' in esm_model:
+            esm_dim = 480
+        elif 'esm2_t30' in esm_model:
+            esm_dim = 640
+        else:
+            esm_dim = 480
+        
+        self.Graph_encoder = Graph_encoder(
+            node_in_dim=esm_dim,      # No fake geometry, just ESM embeddings
+            edge_in_dim=5,            # Sequence-based edge features: [rel_dist/3, sign, 1hop, 2hop, 3hop]
+            hidden_dim=hidden_dim, 
+            num_layers=num_layers, 
+            drop_rate=dropout,
+            num_heads=num_heads
+        ).to(device)
+        
         self.attention_pool = GlobalAttention(
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
                 nn.BatchNorm1d(hidden_dim // 2),
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, 1),
+                nn.Linear(hidden_dim // 2, 1)
             )
-        )
+        ).to(device)
+        
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
+            
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.BatchNorm1d(hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, 1),
-        )
+            
+            nn.Linear(hidden_dim // 4, 1)
+        ).to(device)
 
         self._initialize_weights()
-        self.to(device)
 
     def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm1d):
-                nn.init.constant_(module.bias, 0)
-                nn.init.constant_(module.weight, 1.0)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
 
-    def build_batch(self, accs, seqs):
-        embeddings = self.esm_extractor.extract(accs, seqs)
-        graphs = [
-            create_graph_from_sequence(seq, emb, self.device)
-            for seq, emb in zip(seqs, embeddings)
-        ]
-        return torch_geometric.data.Batch.from_data_list(graphs).to(self.device)
+    def get_ESM_embeddings(self, accs, seqs):
+        """Get per-residue ESM embeddings using the feature extractor"""
+        embeddings = self.esm_extractor.extract_features(seqs, accs)
+        # Return list of tensors, each with shape [L, d_ESM]
+        return [torch.tensor(emb, device=self.device) for emb in embeddings]
 
     def forward(self, accs, seqs):
-        batch = self.build_batch(accs, seqs)
-        h_V = self.Graph_encoder(batch.x, batch.edge_index, batch.edge_attr,
-                                 batch.batch)
-        pooled = self.attention_pool(h_V, batch.batch)
-        return self.regressor(pooled).squeeze(-1), pooled
+        # Get per-residue ESM embeddings for all sequences
+        esm_embeddings = self.get_ESM_embeddings(accs, seqs)
+        
+        # Create graphs with per-residue embeddings and sequence-based edge features
+        batch_data = []
+        for i, seq in enumerate(seqs):
+            seq_emb = esm_embeddings[i]  # [L, d_ESM] - already per-residue
+            graph_data = create_graph_from_sequence(seq, seq_emb, self.device)
+            batch_data.append(graph_data)
+        
+        batch = torch_geometric.data.Batch.from_data_list(batch_data)
+        batch = batch.to(self.device)
+        
+        # Use ESM embeddings directly (no fake geometry)
+        h_V = batch.x              # [sum_L, d_ESM]
+        h_E = batch.edge_attr      # [num_edges, 5]
+        
+        # GNN encoding
+        h_V = self.Graph_encoder(h_V, batch.edge_index, h_E, batch.batch)
+        
+        # Global pooling
+        h_V_pooled = self.attention_pool(h_V, batch.batch)
+        
+        # Regression
+        output = self.regressor(h_V_pooled)
+        output = output.squeeze(-1)
+        
+        return output, h_V_pooled
 
 
-# ---------------------------------------------------------------------------
-# Residue-level attention
-# ---------------------------------------------------------------------------
+# ===============================
+# DATASET AND DATALOADER
+# ===============================
 
-@torch.no_grad()
-def residue_attention_scores(model, acc, sequence):
-    """Per-residue importance for one variant, min-max normalised to [0, 1].
+def augment_sequence(seq, mask_prob=0.15):
+    seq_list = list(seq)
+    for i in range(len(seq_list)):
+        if random.random() < mask_prob:
+            seq_list[i] = 'X'  # mask token
+    return ''.join(seq_list)
 
-    Combines the global attention-pooling gate with the mean magnitude of each
-    layer's message, which is what the manuscript reports as residue-level
-    interpretation.
+def random_substitution(seq, sub_prob=0.1):
+    amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
+    seq_list = list(seq)
+    for i in range(len(seq_list)):
+        if random.random() < sub_prob and seq_list[i] != 'X':
+            seq_list[i] = random.choice(amino_acids)
+    return ''.join(seq_list)
+
+def sequence_cropping(seq, crop_ratio=0.9):
+    if len(seq) < 50:
+        return seq
+    
+    crop_len = int(len(seq) * crop_ratio)
+    if crop_len >= len(seq):
+        return seq
+    
+    start_idx = random.randint(0, len(seq) - crop_len)
+    return seq[start_idx:start_idx + crop_len]
+
+
+class ProteinDataset(Dataset):
+    def __init__(self, csv_path, fasta_path, target_column, sequence_column, 
+                 augment=False, mask_prob=0.15, sub_prob=0.1, crop_prob=0.0):
+        self.data = pd.read_csv(csv_path)
+        self.fasta_dict = self.read_fasta(fasta_path)
+        self.target_column = target_column
+        self.sequence_column = sequence_column
+        
+        # Augmentation parameters
+        self.augment = augment
+        self.mask_prob = mask_prob
+        self.sub_prob = sub_prob
+        self.crop_prob = crop_prob
+        
+        self.data = self.data[self.data[sequence_column].isin(self.fasta_dict.values())].reset_index(drop=True)
+        print(f"Loaded {len(self.data)} samples from {csv_path}")
+        if augment:
+            print(f"  Augmentation enabled: mask_prob={mask_prob}, sub_prob={sub_prob}, crop_prob={crop_prob}")
+    
+    def read_fasta(self, fasta_path):
+        fasta_dict = {}
+        with open(fasta_path, 'r') as f:
+            header = None
+            for line in f:
+                if line.startswith('>'):
+                    header = line.strip()[1:].split()[0]
+                    fasta_dict[header] = ''
+                else:
+                    if header:
+                        fasta_dict[header] += line.strip()
+        return fasta_dict
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        sequence = row[self.sequence_column]
+        target = float(row[self.target_column])
+        
+        # Apply augmentations if enabled
+        if self.augment:
+            # Random masking
+            if self.mask_prob > 0 and random.random() < 0.5:  # 50% chance to apply masking
+                sequence = augment_sequence(sequence, self.mask_prob)
+            
+            # Random substitution
+            if self.sub_prob > 0 and random.random() < 0.3:  # 30% chance to apply substitution
+                sequence = random_substitution(sequence, self.sub_prob)
+            
+            # Sequence cropping
+            if self.crop_prob > 0 and random.random() < self.crop_prob:
+                sequence = sequence_cropping(sequence, crop_ratio=0.9)
+        
+        acc = None
+        for k, v in self.fasta_dict.items():
+            if v == row[self.sequence_column]:  # Use original sequence for matching
+                acc = k
+                break
+        
+        if acc is None:
+            acc = f"seq_{idx}"
+        
+        return acc, sequence, target
+
+
+def collate_fn(batch):
+    accs, seqs, targets = zip(*batch)
+    targets = torch.tensor(targets, dtype=torch.float32)
+    return list(accs), list(seqs), targets
+
+
+# ===============================
+# REPRESENTATION EXTRACTION
+# ===============================
+
+def extract_initial_esm_embeddings(model, train_loader, val_loader, test_loader, device):
+    """Extract initial ESM embeddings (input to GNN) for all datasets
+    
+    Now extracts per-residue embeddings and averages them for sequence-level representation
     """
+    all_embeddings = []
+    all_targets = []
+    all_protein_ids = []
+    all_sequences = []
+    all_dataset_labels = []
+    
     model.eval()
-    batch = model.build_batch([acc], [sequence])
-
-    h_V, h_E = model.Graph_encoder.embed_inputs(batch.x, batch.edge_attr)
-    layer_importance = []
-    for layer in model.Graph_encoder.layers:
-        dh = layer.attention(h_V, batch.edge_index, h_E)
-        layer_importance.append(torch.norm(dh, dim=1))
-
-        h_V = layer.norm[0](h_V + layer.dropout(dh))
-        h_V = layer.norm[1](h_V + layer.dropout(layer.PositionWiseFeedForward(h_V)))
-        h_E = layer.edge_update(h_V, batch.edge_index, h_E)
-        h_V = layer.context(h_V, batch.batch)
-
-    gate = torch.softmax(model.attention_pool.gate_nn(h_V), dim=0).squeeze(-1)
-    scores = gate * torch.stack(layer_importance).mean(dim=0)
-    scores = scores.cpu().numpy()
-
-    spread = scores.max() - scores.min()
-    if spread > 0:
-        scores = (scores - scores.min()) / spread
-    return scores
-
-
-def extract_attention_table(model, loader, save_dir):
-    """Write per-residue and per-sequence attention tables for a split."""
-    os.makedirs(save_dir, exist_ok=True)
-    residue_rows, sequence_rows = [], []
-
-    for accs, seqs, _ in tqdm.tqdm(loader, desc="Extracting attention"):
-        for acc, seq in zip(accs, seqs):
-            scores = residue_attention_scores(model, acc, seq)
-            for position, (residue, score) in enumerate(zip(seq, scores), start=1):
-                residue_rows.append({
-                    "protein_id": acc,
-                    "position": position,
-                    "residue": residue,
-                    "attention_score": float(score),
-                    "sequence_length": len(seq),
-                })
-            sequence_rows.append({
-                "protein_id": acc,
-                "sequence": seq,
-                "sequence_length": len(seq),
-                "mean_attention": float(scores.mean()),
-                "max_attention": float(scores.max()),
-                "std_attention": float(scores.std()),
-            })
-
-    residue_df = pd.DataFrame(residue_rows)
-    sequence_df = pd.DataFrame(sequence_rows)
-    residue_df.to_csv(os.path.join(save_dir, "attention_per_residue.csv"), index=False)
-    sequence_df.to_csv(os.path.join(save_dir, "attention_per_sequence.csv"), index=False)
-    print(f"Attention tables saved to: {save_dir}")
-    return residue_df, sequence_df
-
-
-# ---------------------------------------------------------------------------
-# Representation extraction
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def extract_representations(model, loaders, stage, use_gnn=True):
-    """Collect sequence-level representations across all splits.
-
-    Args:
-        loaders: ``{split_name: DataLoader}``.
-        stage: label recorded in the output (e.g. ``"post-training"``).
-        use_gnn: if True use the pooled GNN output and record predictions;
-            otherwise mean-pool the raw ESM embeddings.
-    """
-    model.eval()
-    collected = {
-        "embeddings": [], "predictions": [], "targets": [],
-        "protein_ids": [], "sequences": [], "dataset_labels": [],
+    
+    with torch.no_grad():
+        for loader, dataset_name in [(train_loader, 'train'), 
+                                     (val_loader, 'validation'),
+                                     (test_loader, 'test')]:
+            
+            print(f"Processing {dataset_name} dataset...")
+            
+            for batch_idx, (accs, seqs, targets) in enumerate(tqdm.tqdm(loader, desc=dataset_name)):
+                try:
+                    # Get per-residue ESM embeddings
+                    esm_embeddings = model.get_ESM_embeddings(accs, seqs)
+                    
+                    for i in range(len(accs)):
+                        # Average per-residue embeddings to get sequence-level representation
+                        embedding = esm_embeddings[i].mean(dim=0).cpu().numpy()  # [d_ESM]
+                        
+                        all_embeddings.append(embedding)
+                        all_targets.append(targets[i].item())
+                        all_protein_ids.append(accs[i])
+                        all_sequences.append(seqs[i])
+                        all_dataset_labels.append(dataset_name)
+                        
+                except Exception as e:
+                    print(f"Error in batch {batch_idx}: {e}")
+                    continue
+    
+    return {
+        'embeddings': np.vstack(all_embeddings),
+        'targets': np.array(all_targets),
+        'protein_ids': all_protein_ids,
+        'sequences': all_sequences,
+        'dataset_labels': all_dataset_labels,
+        'predictions': np.zeros(len(all_targets))
     }
 
-    for split_name, loader in loaders.items():
-        desc = f"{split_name} ({stage})"
-        for accs, seqs, targets in tqdm.tqdm(loader, desc=desc):
-            if use_gnn:
-                predictions, pooled = model(accs, seqs)
-                collected["embeddings"].append(pooled.cpu().numpy())
-                collected["predictions"].extend(predictions.cpu().numpy())
-            else:
-                embeddings = model.esm_extractor.extract(accs, seqs)
-                collected["embeddings"].append(
-                    np.stack([emb.mean(dim=0).cpu().numpy() for emb in embeddings])
-                )
-            collected["targets"].extend(targets.numpy())
-            collected["protein_ids"].extend(accs)
-            collected["sequences"].extend(seqs)
-            collected["dataset_labels"].extend([split_name] * len(accs))
 
-    collected["embeddings"] = np.vstack(collected["embeddings"])
-    collected["targets"] = np.asarray(collected["targets"])
-    collected["predictions"] = (
-        np.asarray(collected["predictions"]) if use_gnn else None
-    )
-    return collected
-
-
-def save_representations(representations, csv_path):
-    """Write representations (and predictions, when available) to CSV."""
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    embeddings = representations["embeddings"]
-
-    frame = {
-        "protein_id": representations["protein_ids"],
-        "dataset": representations["dataset_labels"],
-        "target": representations["targets"],
+def extract_gnn_representations(model, train_loader, val_loader, test_loader, device, stage=""):
+    """Extract GNN output representations and predictions for all datasets"""
+    all_embeddings = []
+    all_predictions = []
+    all_targets = []
+    all_protein_ids = []
+    all_sequences = []
+    all_dataset_labels = []
+    
+    model.eval()
+    
+    with torch.no_grad():
+        for loader, dataset_name in [(train_loader, 'train'),
+                                     (val_loader, 'validation'),
+                                     (test_loader, 'test')]:
+            
+            print(f"Processing {dataset_name} dataset ({stage})...")
+            
+            for batch_idx, (accs, seqs, targets) in enumerate(tqdm.tqdm(loader, desc=dataset_name)):
+                try:
+                    targets = targets.to(device)
+                    
+                    predictions, gnn_embeddings = model(accs, seqs)
+                    
+                    all_embeddings.append(gnn_embeddings.cpu().numpy())
+                    all_predictions.extend(predictions.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
+                    all_protein_ids.extend(accs)
+                    all_sequences.extend(seqs)
+                    all_dataset_labels.extend([dataset_name] * len(accs))
+                    
+                except Exception as e:
+                    print(f"Error in batch {batch_idx}: {e}")
+                    continue
+    
+    all_embeddings = np.vstack(all_embeddings) if all_embeddings else np.array([])
+    
+    return {
+        'embeddings': all_embeddings,
+        'predictions': np.array(all_predictions),
+        'targets': np.array(all_targets),
+        'protein_ids': all_protein_ids,
+        'sequences': all_sequences,
+        'dataset_labels': all_dataset_labels
     }
-    if representations["predictions"] is not None:
-        frame["prediction"] = representations["predictions"]
-        frame["error"] = representations["predictions"] - representations["targets"]
-    for i in range(embeddings.shape[1]):
-        frame[f"dim_{i}"] = embeddings[:, i]
-
-    df = pd.DataFrame(frame)
-    df.to_csv(csv_path, index=False, float_format="%.6f")
-    counts = df["dataset"].value_counts().to_dict()
-    print(f"Saved {len(df)} rows x {embeddings.shape[1]} dims to {csv_path} "
-          f"({counts})")
-    return df
 
 
-def plot_representation_comparison(initial, pre, post, output_dir, prefix):
-    """PCA of each representation plus a pre/post R2 comparison."""
-    os.makedirs(output_dir, exist_ok=True)
+def save_representations_to_csv(representations_dict, csv_path, representation_type='gnn_output'):
+    """Save representations to CSV file with proper formatting"""
+    
+    df_data = {
+        'protein_id': representations_dict['protein_ids'],
+        'dataset': representations_dict['dataset_labels'],
+        'target': representations_dict['targets']
+    }
+    
+    if representation_type == 'gnn_output':
+        df_data['prediction'] = representations_dict['predictions']
+        df_data['error'] = representations_dict['predictions'] - representations_dict['targets']
+    
+    embeddings = representations_dict['embeddings']
+    n_dims = embeddings.shape[1]
+    
+    for i in range(n_dims):
+        df_data[f'dim_{i}'] = embeddings[:, i]
+    
+    df = pd.DataFrame(df_data)
+    
+    metadata = {
+        'representation_type': representation_type,
+        'embedding_dimensions': n_dims,
+        'total_samples': len(df),
+        'train_samples': len(df[df['dataset'] == 'train']),
+        'val_samples': len(df[df['dataset'] == 'validation']),
+        'test_samples': len(df[df['dataset'] == 'test'])
+    }
+    
+    df.to_csv(csv_path, index=False, float_format='%.6f')
+    
+    metadata_path = csv_path.replace('.csv', '_metadata.txt')
+    with open(metadata_path, 'w') as f:
+        for key, value in metadata.items():
+            f.write(f"{key}: {value}\n")
+    
+    print(f"  Saved {len(df)} samples with {n_dims} dimensions")
+    print(f"  Dataset distribution: train={metadata['train_samples']}, "
+          f"val={metadata['val_samples']}, test={metadata['test_samples']}")
 
+
+def create_representation_comparison_plots(initial_repr, pre_repr, post_repr, output_dir, prefix):
+    """Create comparison plots for the three representation types"""
+    
+    # PCA comparison
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    for ax, (representation, title) in zip(axes, [
-        (initial, "Initial ESM"),
-        (pre, "Pre-training GNN"),
-        (post, "Post-training GNN"),
-    ]):
+    
+    representations = [
+        (initial_repr, "Initial ESM"),
+        (pre_repr, "Pre-training GNN"),
+        (post_repr, "Post-training GNN")
+    ]
+    
+    for idx, (repr_dict, title) in enumerate(representations):
+        embeddings = repr_dict['embeddings']
+        targets = repr_dict['targets']
+        
         pca = PCA(n_components=2)
-        projected = pca.fit_transform(representation["embeddings"])
-        scatter = ax.scatter(projected[:, 0], projected[:, 1],
-                             c=representation["targets"], cmap="viridis",
-                             alpha=0.6, s=20)
-        explained = pca.explained_variance_ratio_
-        ax.set_title(f"{title}\n(Var explained: {explained.sum():.2%})")
-        ax.set_xlabel(f"PC1 ({explained[0]:.2%})")
-        ax.set_ylabel(f"PC2 ({explained[1]:.2%})")
-        plt.colorbar(scatter, ax=ax, label="Target value")
-
-    plt.suptitle(f"PCA comparison of representations\n{prefix}", fontsize=14, y=1.02)
+        pca_emb = pca.fit_transform(embeddings)
+        
+        scatter = axes[idx].scatter(pca_emb[:, 0], pca_emb[:, 1],
+                                   c=targets, cmap='viridis',
+                                   alpha=0.6, s=20)
+        axes[idx].set_title(f'{title}\n(Var explained: {pca.explained_variance_ratio_.sum():.2%})')
+        axes[idx].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})')
+        axes[idx].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%})')
+        plt.colorbar(scatter, ax=axes[idx], label='Target Value')
+    
+    plt.suptitle(f'PCA Comparison of Representations\n{prefix}', fontsize=14, y=1.02)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"pca_comparison_{prefix}.png"),
-                dpi=300, bbox_inches="tight")
+    plt.savefig(os.path.join(output_dir, f'pca_comparison_{prefix}.png'), dpi=300, bbox_inches='tight')
     plt.close()
-
-    splits = ["train", "val", "test"]
-    fig, ax = plt.subplots(figsize=(10, 6))
-    positions = np.arange(len(splits))
+    
+    # Performance comparison bar plot
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    
+    splits = ['train', 'validation', 'test']
+    pre_r2s = []
+    post_r2s = []
+    
+    for split in splits:
+        pre_mask = [label == split for label in pre_repr['dataset_labels']]
+        if any(pre_mask):
+            pre_targets = np.array(pre_repr['targets'])[pre_mask]
+            pre_preds = np.array(pre_repr['predictions'])[pre_mask]
+            pre_r2s.append(r2_score(pre_targets, pre_preds))
+        else:
+            pre_r2s.append(0)
+        
+        post_mask = [label == split for label in post_repr['dataset_labels']]
+        if any(post_mask):
+            post_targets = np.array(post_repr['targets'])[post_mask]
+            post_preds = np.array(post_repr['predictions'])[post_mask]
+            post_r2s.append(r2_score(post_targets, post_preds))
+        else:
+            post_r2s.append(0)
+    
+    x = np.arange(len(splits))
     width = 0.35
-
-    for offset, representation, label, color in [
-        (-width / 2, pre, "Pre-training", "lightcoral"),
-        (width / 2, post, "Post-training", "lightgreen"),
-    ]:
-        scores = []
-        labels = np.asarray(representation["dataset_labels"])
-        for split in splits:
-            mask = labels == split
-            scores.append(
-                common.regression_metrics(
-                    representation["targets"][mask],
-                    representation["predictions"][mask],
-                )["r2"] if mask.any() else 0.0
-            )
-        bars = ax.bar(positions + offset, scores, width, label=label, color=color)
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{bar.get_height():.3f}", ha="center", va="bottom")
-
-    ax.set_xlabel("Dataset split")
-    ax.set_ylabel("R2 score")
-    ax.set_title(f"Model performance comparison\n{prefix}")
-    ax.set_xticks(positions)
+    
+    bars1 = ax.bar(x - width/2, pre_r2s, width, label='Pre-training', color='lightcoral')
+    bars2 = ax.bar(x + width/2, post_r2s, width, label='Post-training', color='lightgreen')
+    
+    ax.set_xlabel('Dataset Split')
+    ax.set_ylabel('R2 Score')
+    ax.set_title(f'Model Performance Comparison\n{prefix}')
+    ax.set_xticks(x)
     ax.set_xticklabels(splits)
     ax.legend()
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.3f}', ha='center', va='bottom')
+    
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"performance_comparison_{prefix}.png"), dpi=300)
+    plt.savefig(os.path.join(output_dir, f'performance_comparison_{prefix}.png'), dpi=300)
     plt.close()
-    print(f"Comparison plots saved to: {output_dir}")
+    
+    print(f"  Created PCA comparison plot")
+    print(f"  Created performance comparison plot")
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
+# ===============================
+# VISUALIZATION FUNCTIONS
+# ===============================
 
-def run_epoch(model, loader, criterion, device, optimizer=None, desc="Train"):
-    """One pass over ``loader``; an optimizer switches on training behaviour."""
-    is_train = optimizer is not None
-    model.train(is_train)
+def create_parity_plot(true_values, pred_values, save_path, experiment_name=""):
+    true_values = np.array(true_values)
+    pred_values = np.array(pred_values)
+    
+    os.makedirs(save_path, exist_ok=True)
+    
+    fig = plt.figure(figsize=(12, 12))
+    gs = fig.add_gridspec(3, 3, width_ratios=[1, 4, 1], height_ratios=[1, 4, 1],
+                         hspace=0, wspace=0)
+    
+    ax_main = fig.add_subplot(gs[1, 1])
+    ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
+    ax_right = fig.add_subplot(gs[1, 2], sharey=ax_main)
+    
+    min_val = min(min(true_values), min(pred_values))
+    max_val = max(max(true_values), max(pred_values))
+    
+    range_buffer = (max_val - min_val) * 0.05
+    plot_min = min_val - range_buffer
+    plot_max = max_val + range_buffer
+    
+    n_bins = 100
+    bins = np.linspace(plot_min, plot_max, n_bins+1)
+    
+    ax_main.scatter(true_values, pred_values, c='blue', alpha=0.6, edgecolors='w', 
+               s=50, label='Test predictions')
+    
+    ax_main.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', 
+                linewidth=2, label='y = x', alpha=0.8)
+    
+    mse = np.mean((true_values - pred_values) ** 2)
+    mae = np.mean(np.abs(true_values - pred_values))
+    r2 = np.corrcoef(true_values, pred_values)[0, 1]**2 if len(set(true_values)) > 1 else 0.0
+    n_samples = len(true_values)
+    ax_main.text(plot_min + (plot_max - plot_min) * 0.05, 
+                plot_max - (plot_max - plot_min) * 0.15,
+                 f'Test data\nN: {n_samples}\nMAE: {mae:.4f}\n$R^2$: {r2:.4f}',
+                fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+    
+    ax_main.set_xlabel('True Values', fontsize=14)
+    ax_main.set_ylabel('Predicted Values', fontsize=14)
+    ax_main.set_xlim(plot_min, plot_max)
+    ax_main.set_ylim(plot_min, plot_max)
+    
+    ax_top.hist(true_values, bins=bins, density=True, alpha=0.7, 
+               color='lightblue', edgecolor='black', linewidth=0.5)
+    
+    try:
+        kde_true = gaussian_kde(true_values)
+        x_range = np.linspace(plot_min, plot_max, 200)
+        density_true = kde_true(x_range)
+        ax_top.plot(x_range, density_true, 'b-', linewidth=2, label='True values density')
+    except:
+        pass
+    
+    ax_top.set_xlim(plot_min, plot_max)
+    ax_top.set_ylabel('')
+    ax_top.tick_params(axis='x', labelbottom=False)
+    ax_top.set_yticks([])
+    
+    ax_right.hist(pred_values, bins=bins, density=True, alpha=0.7, 
+                 color='lightblue', edgecolor='black', linewidth=0.5, 
+                 orientation='horizontal')
+    
+    try:
+        kde_pred = gaussian_kde(pred_values)
+        y_range = np.linspace(plot_min, plot_max, 200)
+        density_pred = kde_pred(y_range)
+        ax_right.plot(density_pred, y_range, 'b-', linewidth=2, label='Predicted values density')
+    except:
+        pass
+    
+    ax_right.set_ylim(plot_min, plot_max)
+    ax_right.set_xlabel('')
+    ax_right.tick_params(axis='y', labelleft=False)
+    ax_right.set_xticks([])
+    
+    for spine in ax_top.spines.values():
+        spine.set_visible(False)
+    for spine in ax_right.spines.values():
+        spine.set_visible(False)
+    
+    title = 'ESM-GNN Parity Plot'
+    if experiment_name:
+        title += f'\n{experiment_name}'
+    fig.suptitle(title, fontsize=16, y=0.95)
+    
+    plt.savefig(os.path.join(save_path, 'parity_plot_with_density.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Parity plot saved to: {os.path.join(save_path, 'parity_plot_with_density.png')}")
+    
+    return {
+        'mse': float(mse), 
+        'mae': float(mae), 
+        'r2': float(r2)
+    }
 
-    total_loss = 0.0
-    predictions, targets = [], []
 
-    progress = tqdm.tqdm(loader, desc=desc)
-    with torch.set_grad_enabled(is_train):
-        for accs, seqs, batch_targets in progress:
+def plot_training_curves(train_losses, val_losses, train_r2s, val_r2s, learning_rates, save_dir):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    epochs = range(1, len(train_losses) + 1)
+    
+    axes[0, 0].plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+    axes[0, 0].plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss (MSE)')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].set_yscale('log')
+    
+    best_epoch = np.argmin(val_losses) + 1
+    axes[0, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7, 
+                      label=f'Best Epoch ({best_epoch})')
+    axes[0, 0].legend()
+    
+    axes[0, 1].plot(epochs, train_r2s, 'b-', label='Training R2', linewidth=2)
+    axes[0, 1].plot(epochs, val_r2s, 'r-', label='Validation R2', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('R2 Score')
+    axes[0, 1].set_title('Training and Validation R2')
+    axes[0, 1].legend()
+    axes[0, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+    
+    axes[1, 0].plot(epochs, learning_rates, 'g-', label='Learning Rate', linewidth=2)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].legend()
+    axes[1, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+    
+    loss_diff = np.array(val_losses) - np.array(train_losses)
+    axes[1, 1].plot(epochs, loss_diff, 'purple', linewidth=2)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Val Loss - Train Loss')
+    axes[1, 1].set_title('Overfitting Indicator')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+    axes[1, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/training_curves.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Training curves saved to: {save_dir}/training_curves.png")
+
+
+# ===============================
+# MAIN TRAINING AND EXTRACTION FUNCTIONS
+# ===============================
+
+def run_training_loop(model, train_loader, val_loader, args, device, save_dir=None):
+    """Shared epoch loop (train + validate + early stopping + checkpointing).
+
+    Used by both train_mode() and all_in_one_mode() so the loop only lives
+    in one place instead of being duplicated across the two modes.
+    """
+    if save_dir is None:
+        save_dir = args.save_dir
+
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+                                                    factor=0.7, patience=10)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_epoch = 0
+
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_r2': [], 'val_r2': [],
+        'train_mae': [], 'val_mae': [],
+        'lr': []
+    }
+
+    print(f"Training for {args.min_epoch}-{args.max_epoch} epochs with patience {args.patience}")
+
+    for epoch in range(args.max_epoch):
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nEpoch {epoch+1}/{args.max_epoch} (LR: {current_lr:.2e})")
+
+        # --- Train ---
+        model.train()
+        total_loss, predictions, targets = 0, [], []
+        pbar = tqdm.tqdm(train_loader, desc="Training")
+        for accs, seqs, batch_targets in pbar:
             batch_targets = batch_targets.to(device)
 
-            if is_train:
-                optimizer.zero_grad()
+            optimizer.zero_grad()
             pred, _ = model(accs, seqs)
+
             loss = criterion(pred, batch_targets)
-            if is_train:
-                loss.backward()
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
             total_loss += loss.item()
             predictions.extend(pred.detach().cpu().numpy())
             targets.extend(batch_targets.cpu().numpy())
-            progress.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    metrics = common.regression_metrics(targets, predictions)
-    metrics["loss"] = total_loss / max(len(loader), 1)
-    return metrics
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
+        train_loss = total_loss / len(train_loader)
+        train_r2 = r2_score(targets, predictions)
+        train_mae = mean_absolute_error(targets, predictions)
 
-@torch.no_grad()
-def collect_predictions(model, loader, device):
-    """Predictions, targets, pooled embeddings and identifiers for a split."""
-    model.eval()
-    preds, targets, embeddings, accs_all, seqs_all = [], [], [], [], []
+        # --- Validate ---
+        model.eval()
+        total_loss, predictions, targets = 0, [], []
+        with torch.no_grad():
+            pbar = tqdm.tqdm(val_loader, desc="Validation")
+            for accs, seqs, batch_targets in pbar:
+                batch_targets = batch_targets.to(device)
 
-    for accs, seqs, batch_targets in loader:
-        pred, pooled = model(accs, seqs)
-        preds.extend(pred.cpu().numpy())
-        targets.extend(batch_targets.numpy())
-        embeddings.append(pooled.cpu().numpy())
-        accs_all.extend(accs)
-        seqs_all.extend(seqs)
+                pred, _ = model(accs, seqs)
+                loss = criterion(pred, batch_targets)
 
-    return (np.asarray(preds), np.asarray(targets),
-            np.vstack(embeddings), accs_all, seqs_all)
+                total_loss += loss.item()
+                predictions.extend(pred.cpu().numpy())
+                targets.extend(batch_targets.cpu().numpy())
 
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-def train_model(model, train_loader, val_loader, args, device):
-    """Train with ReduceLROnPlateau, checkpointing and delayed early stopping."""
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience
-    )
+        val_loss = total_loss / len(val_loader)
+        val_r2 = r2_score(targets, predictions)
+        val_mae = mean_absolute_error(targets, predictions)
 
-    history = common.new_history()
-    best_val_loss = float("inf")
-    patience_counter = 0
-    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
+        scheduler.step(val_loss)
 
-    print(f"Training for {args.min_epoch}-{args.max_epoch} epochs "
-          f"(early stopping patience {args.patience})")
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_r2'].append(train_r2)
+        history['val_r2'].append(val_r2)
+        history['train_mae'].append(train_mae)
+        history['val_mae'].append(val_mae)
+        history['lr'].append(current_lr)
 
-    for epoch in range(1, args.max_epoch + 1):
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"\nEpoch {epoch}/{args.max_epoch} (LR: {current_lr:.2e})")
+        print(f"Train - Loss: {train_loss:.4f}, R2: {train_r2:.4f}, MAE: {train_mae:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, R2: {val_r2:.4f}, MAE: {val_mae:.4f}")
 
-        train_metrics = run_epoch(model, train_loader, criterion, device,
-                                  optimizer=optimizer, desc="Training")
-        val_metrics = run_epoch(model, val_loader, criterion, device,
-                                desc="Validation")
-        scheduler.step(val_metrics["loss"])
-        common.update_history(history, train_metrics, val_metrics, current_lr)
-
-        print(f"Train - loss {train_metrics['loss']:.4f}, "
-              f"R2 {train_metrics['r2']:.4f}, MAE {train_metrics['mae']:.4f}")
-        print(f"Val   - loss {val_metrics['loss']:.4f}, "
-              f"R2 {val_metrics['r2']:.4f}, MAE {val_metrics['mae']:.4f}")
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            patience_counter = 0
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
             torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_metrics": train_metrics,
-                "val_metrics": val_metrics,
-                "args": vars(args),
-            }, checkpoint_path)
-            print(f"New best model saved (val loss {best_val_loss:.4f})")
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_r2': train_r2,
+                'val_r2': val_r2,
+                'args': args
+            }, f'{save_dir}/best_model.pt')
+            patience_counter = 0
+            print(f"New best model saved! Val Loss: {val_loss:.4f}")
         else:
             patience_counter += 1
 
-        if epoch >= args.min_epoch and patience_counter >= args.patience:
-            print(f"Early stopping after {epoch} epochs")
-            break
-        if epoch < args.min_epoch:
-            print(f"Minimum epoch not reached ({epoch}/{args.min_epoch})")
+        if epoch + 1 >= args.min_epoch:
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        else:
+            print(f"Min epoch not reached ({epoch+1}/{args.min_epoch}), continuing training...")
 
-    return history, checkpoint_path
-
-
-def evaluate_and_report(model, loaders, args, device, history):
-    """Restore the best checkpoint, then write metrics, plots and predictions."""
-    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"\nLoaded best model from epoch {checkpoint['epoch']}")
-
-    common.save_training_history(history, args.save_dir)
-    common.plot_training_curves(history, args.save_dir, experiment_name="GraphAAV")
-
-    all_metrics = {"best_epoch": checkpoint["epoch"]}
-    test_preds = test_targets = None
-    for split_name, loader in loaders.items():
-        preds, targets, embeddings, accs, seqs = collect_predictions(
-            model, loader, device
-        )
-        all_metrics[split_name] = common.regression_metrics(targets, preds)
-        if split_name == "test":
-            test_preds, test_targets = preds, targets
-            common.save_predictions_csv(accs, seqs, targets, preds, args.save_dir,
-                                        embeddings=embeddings)
-
-    common.plot_parity(test_targets, test_preds, args.save_dir,
-                       dataset_name="Test", experiment_name="GraphAAV")
-    common.save_metrics_json(all_metrics, args.save_dir)
-
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    for split_name in loaders:
-        print(common.format_metrics(split_name, all_metrics[split_name]))
-    print("=" * 60)
-
-    if args.extract_attention:
-        extract_attention_table(
-            model, loaders["test"], os.path.join(args.save_dir, "attention_analysis")
-        )
-    return all_metrics
+    return history, best_epoch, best_val_loss
 
 
-def main():
-    args = parse_arguments()
-    common.set_seed(args.seed)
-    device = common.get_device()
+def train_mode(args):
+    """Standard training mode"""
+    print("=== TRAINING MODE ===")
+    print(f"Training configuration:")
+    print(f"  Min epochs: {args.min_epoch}")
+    print(f"  Max epochs: {args.max_epoch}")
+    print(f"  Patience: {args.patience}")
+    print(f"  ESM model: {args.esm_model}")
+    
     os.makedirs(args.save_dir, exist_ok=True)
+    
+    print("Loading datasets...")
+    train_dataset = ProteinDataset(args.train_csv, args.fasta_path, args.target_column, args.sequence_column)
+    val_dataset = ProteinDataset(args.val_csv, args.fasta_path, args.target_column, args.sequence_column)
+    test_dataset = ProteinDataset(args.test_csv, args.fasta_path, args.target_column, args.sequence_column)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                             shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                           shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                            shuffle=False, collate_fn=collate_fn)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    model = ESM_GNN_Model(
+        hidden_dim=args.hidden_dim, 
+        num_layers=args.num_layers, 
+        dropout=args.dropout, 
+        device=device, 
+        num_heads=args.num_heads,
+        esm_model=args.esm_model,
+        use_finetuned=args.use_finetuned,
+        checkpoint_path=args.finetuned_checkpoint
+    )
+    model = model.to(device)
+    
+    print("Starting training...")
+    history, best_epoch, best_val_loss = run_training_loop(model, train_loader, val_loader, args, device)
+    
+    # Save training history
+    print("\nSaving training history...")
+    save_training_history(history['train_loss'], history['val_loss'],
+                         history['train_r2'], history['val_r2'],
+                         history['train_mae'], history['val_mae'], args.save_dir)
+    
+    # Load best model for testing
+    print("\nLoading best model for testing...")
+    checkpoint = torch.load(f'{args.save_dir}/best_model.pt', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Get final predictions
+    print("Getting final predictions...")
+    model.eval()
+    
+    def get_predictions_with_info(dataloader):
+        all_preds, all_targets, all_embeddings, all_accs, all_seqs = [], [], [], [], []
+        
+        with torch.no_grad():
+            for accs, seqs, targets in dataloader:
+                targets = targets.to(device)
+                pred, embeddings = model(accs, seqs)
+                
+                all_preds.extend(pred.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+                all_embeddings.append(embeddings.cpu().numpy())
+                all_accs.extend(accs)
+                all_seqs.extend(seqs)
+        
+        return all_preds, all_targets, np.vstack(all_embeddings), all_accs, all_seqs
+    
+    train_preds, train_targets, train_embeddings, train_accs, train_seqs = get_predictions_with_info(train_loader)
+    val_preds, val_targets, val_embeddings, val_accs, val_seqs = get_predictions_with_info(val_loader)
+    test_preds, test_targets, test_embeddings, test_accs, test_seqs = get_predictions_with_info(test_loader)
+    
+    # Save test predictions with embeddings
+    print("\nSaving test predictions with embeddings...")
+    save_test_predictions_to_csv(
+        test_accs, test_seqs, test_targets, test_preds,
+        embeddings=test_embeddings,
+        save_path=args.save_dir,
+        filename="test_prediction.csv",
+        include_embeddings=True
+    )
+    
+    # Create visualizations
+    print("Creating visualizations...")
+    
+    plot_training_curves(history['train_loss'], history['val_loss'],
+                        history['train_r2'], history['val_r2'],
+                        history['lr'], args.save_dir)
+    
+    test_metrics = create_parity_plot(test_targets, test_preds, args.save_dir, 
+                                 experiment_name="ESM-GNN Test Set")
+    
+    # Save final metrics and predictions
+    final_metrics = {
+        'Train': {'R2': r2_score(train_targets, train_preds), 'RMSE': np.sqrt(mean_squared_error(train_targets, train_preds))},
+        'Validation': {'R2': r2_score(val_targets, val_preds), 'RMSE': np.sqrt(mean_squared_error(val_targets, val_preds))},
+        'Test': {'R2': r2_score(test_targets, test_preds), 'RMSE': np.sqrt(mean_squared_error(test_targets, test_preds))}
+    }
+    
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    for dataset, metrics in final_metrics.items():
+        print(f"{dataset:>12}: R2 = {metrics['R2']:.4f}, RMSE = {metrics['RMSE']:.4f}")
+    print("="*60)
+    
+    print(f"\nTraining completed! Results saved to {args.save_dir}")
+    print(f"  - Best model: best_model.pt")
+    print(f"  - Training history: training_history.csv")
+    print(f"  - Test predictions: test_prediction.csv")
+    print(f"  - Training curves: training_curves.png")
+    print(f"  - Parity plot: parity_plot_with_density.png")
 
-    print("=" * 60)
-    print("GraphAAV")
-    print("=" * 60)
-    print(f"Mode          : {args.mode}")
-    print(f"Target        : {args.target_column}")
-    print(f"ESM encoder   : {args.esm_model}")
-    print(f"Hidden / heads: {args.hidden_dim} / {args.num_heads}")
-    print(f"Layers        : {args.num_layers}")
-    print(f"Batch / LR    : {args.batch_size} / {args.lr}")
-    print(f"Epochs        : {args.min_epoch}-{args.max_epoch}")
-    print(f"Device        : {device}")
-    print(f"Save dir      : {args.save_dir}")
-    print("=" * 60)
 
-    train_loader, val_loader, test_loader = common.build_dataloaders(args)
-    loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+def save_training_history(train_losses, val_losses, train_r2s, val_r2s, 
+                          train_maes, val_maes, save_dir, filename="training_history.csv"):
+    # Create training history DataFrame
+    max_len = max(len(train_losses), len(val_losses))
+    
+    history_data = {
+        'epoch': list(range(1, max_len + 1)),
+        'train_loss': train_losses + [None] * (max_len - len(train_losses)),
+        'val_loss': val_losses + [None] * (max_len - len(val_losses)),
+        'train_r2': train_r2s + [None] * (max_len - len(train_r2s)),
+        'val_r2': val_r2s + [None] * (max_len - len(val_r2s)),
+        'train_mae': train_maes + [None] * (max_len - len(train_maes)),
+        'val_mae': val_maes + [None] * (max_len - len(val_maes))
+    }
+    
+    history_df = pd.DataFrame(history_data)
+    
+    # Save to CSV
+    os.makedirs(save_dir, exist_ok=True)
+    full_path = os.path.join(save_dir, filename)
+    history_df.to_csv(full_path, index=False)
+    
+    print(f"Training history saved to: {full_path}")
+    
+    return history_df, full_path
 
-    model = GraphAAV(
+
+def save_test_predictions_to_csv(accs, seqs, true_values, predicted_values, 
+                                embeddings=None, save_path=None, 
+                                filename="test_prediction.csv",
+                                include_embeddings=False):
+    # Create base dataframe
+    data = {
+        'protein_id': accs,
+        'sequence': seqs,
+        'true_value': true_values,
+        'predicted_value': predicted_values,
+        'sequence_length': [len(seq) for seq in seqs],
+        'prediction_error': np.array(predicted_values) - np.array(true_values),
+        'absolute_error': np.abs(np.array(predicted_values) - np.array(true_values))
+    }
+    
+    # Add embeddings if requested and available
+    if include_embeddings and embeddings is not None:
+        print(f"Adding embeddings to CSV (shape: {embeddings.shape})")
+        # embeddings should be [batch_size, embedding_dim]
+        for i in range(embeddings.shape[1]):
+            data[f'embedding_{i}'] = embeddings[:, i]
+    
+    # Create DataFrame
+    df = pd.DataFrame(data)
+    
+    # Calculate additional metrics
+    df['squared_error'] = df['prediction_error'] ** 2
+    
+    # Save to CSV
+    if save_path:
+        os.makedirs(save_path, exist_ok=True)
+        full_path = os.path.join(save_path, filename)
+    else:
+        full_path = filename
+    
+    df.to_csv(full_path, index=False)
+    
+    # Print summary statistics
+    print(f"\n=== Test Predictions Summary ===")
+    print(f"Saved {len(df)} predictions to: {full_path}")
+    print(f"MAE: {df['absolute_error'].mean():.4f}")
+    print(f"RMSE: {np.sqrt(df['squared_error'].mean()):.4f}")
+    print(f"R2: {r2_score(df['true_value'], df['predicted_value']):.4f}")
+    print(f"Mean true value: {df['true_value'].mean():.4f}")
+    print(f"Mean predicted value: {df['predicted_value'].mean():.4f}")
+    print("===============================\n")
+    
+    return df
+
+
+def all_in_one_mode(args):
+    """Execute everything in one go"""
+    
+    print("\n" + "="*60)
+    print("ALL-IN-ONE MODE: TRAINING + REPRESENTATION EXTRACTION")
+    print("="*60)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    filename_prefix = f"heads_{args.num_heads}_layers_{args.num_layers}_hidden_{args.hidden_dim}"
+    
+    # STEP 1: LOAD DATASETS
+    print("\n" + "="*60)
+    print("STEP 1: LOADING DATASETS")
+    print("="*60)
+    
+    train_dataset = ProteinDataset(args.train_csv, args.fasta_path, 
+                                  args.target_column, args.sequence_column)
+    val_dataset = ProteinDataset(args.val_csv, args.fasta_path, 
+                                args.target_column, args.sequence_column)
+    test_dataset = ProteinDataset(args.test_csv, args.fasta_path, 
+                                 args.target_column, args.sequence_column)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                             shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                           shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                            shuffle=False, collate_fn=collate_fn)
+    
+    train_loader_noshuffle = DataLoader(train_dataset, batch_size=args.batch_size, 
+                                        shuffle=False, collate_fn=collate_fn)
+    
+    print(f"Loaded datasets:")
+    print(f"   Train: {len(train_dataset)} samples")
+    print(f"   Val: {len(val_dataset)} samples")
+    print(f"   Test: {len(test_dataset)} samples")
+    
+    # STEP 2: EXTRACT PRE-TRAINING REPRESENTATIONS
+    print("\n" + "="*60)
+    print("STEP 2: EXTRACTING PRE-TRAINING REPRESENTATIONS")
+    print("="*60)
+    
+    model = ESM_GNN_Model(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
         device=device,
         num_heads=args.num_heads,
         esm_model=args.esm_model,
+        use_finetuned=args.use_finetuned,
+        checkpoint_path=args.finetuned_checkpoint
+    ).to(device)
+    
+    print("\nExtracting initial ESM embeddings...")
+    initial_representations = extract_initial_esm_embeddings(
+        model, train_loader_noshuffle, val_loader, test_loader, device
     )
-
-    prefix = f"heads_{args.num_heads}_layers_{args.num_layers}_hidden_{args.hidden_dim}"
-    initial_repr = pre_repr = None
-
-    if args.mode == "all":
-        # Representations are taken before training so that the pre/post
-        # comparison uses the same (unshuffled) ordering of samples.
-        eval_loaders = {
-            "train": torch.utils.data.DataLoader(
-                train_loader.dataset, batch_size=args.batch_size, shuffle=False,
-                collate_fn=common.collate_fn,
-            ),
-            "val": val_loader,
-            "test": test_loader,
-        }
-        print("\nExtracting initial ESM representations...")
-        initial_repr = extract_representations(model, eval_loaders, "initial",
-                                               use_gnn=False)
-        save_representations(
-            initial_repr,
-            os.path.join(args.save_dir, f"esm_representations_{prefix}.csv"),
+    
+    initial_csv_path = os.path.join(
+        args.save_dir, 
+        f"esm_representations_{filename_prefix}.csv"
+    )
+    save_representations_to_csv(initial_representations, initial_csv_path, 
+                               representation_type='initial_input')
+    print(f"Saved ESM representations: {initial_csv_path}")
+    
+    print("\nExtracting pre-training GNN representations...")
+    pre_training_representations = extract_gnn_representations(
+        model, train_loader_noshuffle, val_loader, test_loader, device, "pre-training"
+    )
+    
+    pre_training_csv_path = os.path.join(
+        args.save_dir,
+        f"gnn_representations_{filename_prefix}_pre_training.csv"
+    )
+    save_representations_to_csv(pre_training_representations, pre_training_csv_path,
+                               representation_type='gnn_output')
+    print(f"Saved pre-training GNN representations: {pre_training_csv_path}")
+    
+    # STEP 3: TRAIN MODEL
+    print("\n" + "="*60)
+    print("STEP 3: TRAINING MODEL")
+    print("="*60)
+    
+    history, best_epoch, best_val_loss = run_training_loop(model, train_loader, val_loader, args, device)
+    
+    # STEP 4: EXTRACT POST-TRAINING REPRESENTATIONS
+    print("\n" + "="*60)
+    print("STEP 4: EXTRACTING POST-TRAINING REPRESENTATIONS")
+    print("="*60)
+    
+    checkpoint = torch.load(f'{args.save_dir}/best_model.pt', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Loaded best model from epoch {checkpoint['epoch']+1}")
+    
+    print("\nExtracting post-training GNN representations...")
+    post_training_representations = extract_gnn_representations(
+        model, train_loader_noshuffle, val_loader, test_loader, device, "post-training"
+    )
+    
+    post_training_csv_path = os.path.join(
+        args.save_dir,
+        f"gnn_representations_{filename_prefix}_post_training.csv"
+    )
+    save_representations_to_csv(post_training_representations, post_training_csv_path,
+                               representation_type='gnn_output')
+    print(f"Saved post-training GNN representations: {post_training_csv_path}")
+    
+    # STEP 5: CREATE VISUALIZATIONS
+    print("\n" + "="*60)
+    print("STEP 5: CREATING VISUALIZATIONS & FINAL ANALYSIS")
+    print("="*60)
+    
+    # Reuse the test-set predictions/targets already computed in STEP 4
+    # instead of re-running a full forward pass over the test set again.
+    test_mask = np.array([label == 'test' for label in post_training_representations['dataset_labels']])
+    test_preds = post_training_representations['predictions'][test_mask]
+    test_targets = post_training_representations['targets'][test_mask]
+    
+    plot_training_curves(history['train_loss'], history['val_loss'],
+                        history['train_r2'], history['val_r2'],
+                        history['lr'], args.save_dir)
+    
+    test_metrics = create_parity_plot(test_targets, test_preds, args.save_dir, 
+                                     experiment_name="ESM-GNN Test Set")
+    
+    if args.compare_representations:
+        comparison_dir = os.path.join(args.save_dir, 'representation_comparison')
+        os.makedirs(comparison_dir, exist_ok=True)
+        
+        create_representation_comparison_plots(
+            initial_representations,
+            pre_training_representations,
+            post_training_representations,
+            comparison_dir,
+            filename_prefix
         )
+        print(f"Comparison plots saved to: {comparison_dir}")
+    
+    # STEP 6: FINAL SUMMARY
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    
+    for split_name in ['train', 'validation', 'test']:
+        post_mask = np.array([label == split_name for label in post_training_representations['dataset_labels']])
+        
+        if post_mask.any():
+            split_targets = post_training_representations['targets'][post_mask]
+            split_preds = post_training_representations['predictions'][post_mask]
+            
+            split_r2 = r2_score(split_targets, split_preds)
+            split_rmse = np.sqrt(mean_squared_error(split_targets, split_preds))
+            split_mae = mean_absolute_error(split_targets, split_preds)
+            
+            print(f"\n{split_name.upper()} SET:")
+            print(f"  R2:   {split_r2:.4f}")
+            print(f"  RMSE: {split_rmse:.4f}")
+            print(f"  MAE:  {split_mae:.4f}")
+    
+    print("\n" + "="*60)
+    print("ALL-IN-ONE EXECUTION COMPLETE!")
+    print("="*60)
+    
+    print("\nOutput files created:")
+    print(f"  1. Model: {args.save_dir}/best_model.pt")
+    print(f"  2. ESM embeddings: {initial_csv_path}")
+    print(f"  3. Pre-training GNN: {pre_training_csv_path}")
+    print(f"  4. Post-training GNN: {post_training_csv_path}")
+    print(f"  5. Training curves: {args.save_dir}/training_curves.png")
+    print(f"  6. Parity plot: {args.save_dir}/parity_plot.png")
+    if args.compare_representations:
+        print(f"  7. Comparison plots: {comparison_dir}/")
+    
+    return {
+        'best_epoch': checkpoint['epoch'] + 1,
+        'best_val_loss': checkpoint['val_loss'],
+        'best_val_r2': checkpoint['val_r2'],
+        'test_metrics': test_metrics
+    }
 
-        print("\nExtracting pre-training GNN representations...")
-        pre_repr = extract_representations(model, eval_loaders, "pre-training")
-        save_representations(
-            pre_repr,
-            os.path.join(args.save_dir, f"gnn_representations_{prefix}_pre.csv"),
-        )
 
-    history, _ = train_model(model, train_loader, val_loader, args, device)
-    evaluate_and_report(model, loaders, args, device, history)
-
-    if args.mode == "all":
-        print("\nExtracting post-training GNN representations...")
-        post_repr = extract_representations(model, eval_loaders, "post-training")
-        save_representations(
-            post_repr,
-            os.path.join(args.save_dir, f"gnn_representations_{prefix}_post.csv"),
-        )
-        if args.compare_representations:
-            plot_representation_comparison(
-                initial_repr, pre_repr, post_repr,
-                os.path.join(args.save_dir, "representation_comparison"), prefix,
-            )
-
-    print(f"\nDone. Results written to {args.save_dir}")
+def main():
+    args = parse_arguments()
+    
+    if args.mode == 'all':
+        # Execute everything at once
+        results = all_in_one_mode(args)
+        print(f"\nAll tasks completed successfully!")
+        print(f"   Best model: Epoch {results['best_epoch']}")
+        print(f"   Best Val R2: {results['best_val_r2']:.4f}")
+        print(f"   Test R2: {results['test_metrics']['r2']:.4f}")
+        
+    elif args.mode == 'train':
+        # Original training mode
+        train_mode(args)
+            
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
