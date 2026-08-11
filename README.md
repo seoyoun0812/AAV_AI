@@ -75,17 +75,6 @@ python src/lightaav.py --target_column YOUR_TARGET_COLUMN \
 
 Use `--help` for the full argument list.
 
-## Defaults
-
-The two models were tuned independently.
-
-| | GraphAAV | LightAAV |
-| --- | --- | --- |
-| Learning rate | 1e-4 | 1e-4 (LoRA: 1e-5) |
-| Batch size | 64 | 32 |
-| LR schedule | ReduceLROnPlateau (0.7, patience 10) | none |
-| Early stopping | patience 15, after epoch 80 | patience 8, after epoch 80 |
-| Encoder | `esm2_t12_35M_UR50D` | `esm2_t12_35M_UR50D` |
 
 ## Outputs
 
